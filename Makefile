@@ -56,7 +56,7 @@ CLANG_BPF_SYS_INCLUDES = $(shell clang -v -E - </dev/null 2>&1 | \
 # Source and Object File Definitions
 #
 # BPF_SOURCES: All eBPF C source files to compile
-BPF_SOURCES := src/ebpf/socket_hook.c
+BPF_SOURCES := src/ebpf/socket_hook.c src/ebpf/tc_hook.c
 
 # BPF_OBJS: Corresponding output object files (.o)
 # Pattern substitution: src/ebpf/foo.c -> .output/foo.o
@@ -193,6 +193,7 @@ help:
 	@echo ""
 	@echo "Build artifacts:"
 	@echo "  .output/socket_hook.o - Socket hook eBPF bytecode"
+	@echo "  .output/tc_hook.o     - TC (Traffic Control) eBPF bytecode"
 	@echo ""
 	@echo "Safety notes:"
 	@echo "  - All output confined to project directory"

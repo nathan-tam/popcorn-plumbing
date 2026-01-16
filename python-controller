@@ -28,62 +28,75 @@ import time
 # Constants
 # ============================================================================
 
-SO_ATTACH_BPF = 50       # Socket option to attach BPF program
-ETH_P_ALL = 0x0003       # Capture all ethernet protocols
-BPF_MAP_LOOKUP_ELEM = 1  # BPF syscall: lookup map element
-BPF_MAP_GET_NEXT_KEY = 4 # BPF syscall: get next map key
-__NR_bpf = 321           # BPF syscall number (x86_64)
+SO_ATTACH_BPF = 50       # Socket option to attach eBPF program
+ETH_P_ALL = 0x0003       # Capture all Ethernet protocols
+BPF_MAP_LOOKUP_ELEM = 1  # BPF syscall command: lookup map element
+BPF_MAP_GET_NEXT_KEY = 4 # BPF syscall command: iterate map keys
+__NR_bpf = 321           # BPF syscall number on x86_64 Linux
 
 
 # ============================================================================
-# Data Structures (must match common.h)
+# Data Structures
+#
+# These must exactly match the C structs in common.h, including padding.
 # ============================================================================
 
 class FlowKey(ctypes.Structure):
     """
-    5-tuple flow identifier - matches struct flow_key in common.h
+    5-tuple flow identifier.
     
-    Total size: 16 bytes
+    Matches struct flow_key in common.h (16 bytes total).
+    Used as the key in the BPF hash map.
     """
     _fields_ = [
-        ("src_ip", ctypes.c_uint32),     # Source IPv4 address
-        ("dst_ip", ctypes.c_uint32),     # Destination IPv4 address
-        ("src_port", ctypes.c_uint16),   # Source port
-        ("dst_port", ctypes.c_uint16),   # Destination port
-        ("proto", ctypes.c_uint8),       # Protocol (TCP=6, UDP=17, ICMP=1)
+        ("src_ip", ctypes.c_uint32),     # Source IP (network byte order)
+        ("dst_ip", ctypes.c_uint32),     # Destination IP (network byte order)
+        ("src_port", ctypes.c_uint16),   # Source port (network byte order)
+        ("dst_port", ctypes.c_uint16),   # Destination port (network byte order)
+        ("proto", ctypes.c_uint8),       # Protocol (1=ICMP, 6=TCP, 17=UDP)
         ("_pad", ctypes.c_uint8 * 3),    # Padding for alignment
     ]
 
 
 class PacketMetrics(ctypes.Structure):
     """
-    Per-flow statistics - matches struct packet_metrics in common.h
+    Per-flow packet statistics.
     
-    Note: 4 bytes of padding after packets_processed for 8-byte alignment.
-    Total size: 32 bytes
+    Matches struct packet_metrics in common.h (32 bytes total).
+    Used as the value in the BPF hash map.
     """
     _fields_ = [
-        ("packets_processed", ctypes.c_uint32),
-        ("_pad", ctypes.c_uint32),        # Implicit padding in C struct
-        ("bytes_processed", ctypes.c_uint64),
-        ("total_latency_ns", ctypes.c_uint64),
-        ("timestamp", ctypes.c_uint64),
+        ("packets_processed", ctypes.c_uint32),  # Packet count
+        ("_pad", ctypes.c_uint32),               # Padding (C compiler inserts this)
+        ("bytes_processed", ctypes.c_uint64),    # Total bytes
+        ("total_latency_ns", ctypes.c_uint64),   # Reserved for latency tracking
+        ("timestamp", ctypes.c_uint64),          # Last seen (nanoseconds)
     ]
 
 
 # ============================================================================
 # libbpf Wrapper
+#
+# Provides Python access to libbpf functions for loading eBPF programs.
 # ============================================================================
 
 class LibBPF:
-    """Minimal wrapper around libbpf shared library."""
+    """
+    Minimal wrapper around the libbpf shared library.
+    
+    Uses ctypes to call libbpf functions for:
+    - Opening compiled eBPF object files (.o)
+    - Loading programs into the kernel
+    - Getting file descriptors for programs and maps
+    """
     
     def __init__(self):
-        """Load libbpf and set up function signatures."""
-        # Find the libbpf shared library
+        """Find and load the libbpf shared library."""
+        # Try standard library lookup first
         lib_path = ctypes.util.find_library("bpf")
+        
+        # Fall back to common installation paths
         if not lib_path:
-            # Try common paths if find_library fails
             for path in ["/usr/lib/x86_64-linux-gnu/libbpf.so.1",
                          "/usr/lib/x86_64-linux-gnu/libbpf.so.0",
                          "/usr/lib/libbpf.so.1",
@@ -96,165 +109,176 @@ class LibBPF:
             raise OSError("libbpf not found. Install: sudo apt-get install libbpf-dev")
         
         self.lib = ctypes.CDLL(lib_path, use_errno=True)
-        self._define_functions()
+        self._setup_function_signatures()
     
-    def _define_functions(self):
-        """Define C function signatures for type safety."""
-        # bpf_object *bpf_object__open(const char *path)
-        self.lib.bpf_object__open.argtypes = [ctypes.c_char_p]
-        self.lib.bpf_object__open.restype = ctypes.c_void_p
+    def _setup_function_signatures(self):
+        """Define C function argument/return types for type safety."""
+        L = self.lib
         
-        # int bpf_object__load(struct bpf_object *obj)
-        self.lib.bpf_object__load.argtypes = [ctypes.c_void_p]
-        self.lib.bpf_object__load.restype = ctypes.c_int
+        # Opening and loading BPF objects
+        L.bpf_object__open.argtypes = [ctypes.c_char_p]
+        L.bpf_object__open.restype = ctypes.c_void_p
         
-        # void bpf_object__close(struct bpf_object *obj)
-        self.lib.bpf_object__close.argtypes = [ctypes.c_void_p]
-        self.lib.bpf_object__close.restype = None
+        L.bpf_object__load.argtypes = [ctypes.c_void_p]
+        L.bpf_object__load.restype = ctypes.c_int
         
-        # struct bpf_program *bpf_object__find_program_by_name(obj, name)
-        self.lib.bpf_object__find_program_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self.lib.bpf_object__find_program_by_name.restype = ctypes.c_void_p
+        L.bpf_object__close.argtypes = [ctypes.c_void_p]
+        L.bpf_object__close.restype = None
         
-        # int bpf_program__fd(const struct bpf_program *prog)
-        self.lib.bpf_program__fd.argtypes = [ctypes.c_void_p]
-        self.lib.bpf_program__fd.restype = ctypes.c_int
+        # Finding programs by name
+        L.bpf_object__find_program_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        L.bpf_object__find_program_by_name.restype = ctypes.c_void_p
         
-        # struct bpf_map *bpf_object__find_map_by_name(obj, name)
-        self.lib.bpf_object__find_map_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self.lib.bpf_object__find_map_by_name.restype = ctypes.c_void_p
+        L.bpf_program__fd.argtypes = [ctypes.c_void_p]
+        L.bpf_program__fd.restype = ctypes.c_int
         
-        # int bpf_map__fd(const struct bpf_map *map)
-        self.lib.bpf_map__fd.argtypes = [ctypes.c_void_p]
-        self.lib.bpf_map__fd.restype = ctypes.c_int
+        # Finding maps by name
+        L.bpf_object__find_map_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        L.bpf_object__find_map_by_name.restype = ctypes.c_void_p
+        
+        L.bpf_map__fd.argtypes = [ctypes.c_void_p]
+        L.bpf_map__fd.restype = ctypes.c_int
     
     def open_and_load(self, path):
-        """Open a BPF object file and load it into the kernel."""
+        """
+        Open a compiled BPF object file and load it into the kernel.
+        
+        Returns the BPF object handle (needed for cleanup).
+        """
         obj = self.lib.bpf_object__open(path.encode())
         if not obj:
-            raise OSError(f"Failed to open BPF object: {path}")
+            raise OSError(f"Failed to open: {path}")
         
-        ret = self.lib.bpf_object__load(obj)
-        if ret != 0:
+        if self.lib.bpf_object__load(obj) != 0:
             self.lib.bpf_object__close(obj)
-            raise OSError(f"Failed to load BPF object (error {ret})")
+            raise OSError(f"Failed to load: {path}")
         
         return obj
     
     def close(self, obj):
-        """Close a BPF object."""
+        """Close a BPF object and free resources."""
         if obj:
             self.lib.bpf_object__close(obj)
     
     def get_program_fd(self, obj, name):
-        """Get file descriptor for a BPF program by name."""
+        """Get the file descriptor for a BPF program by name."""
         prog = self.lib.bpf_object__find_program_by_name(obj, name.encode())
         if not prog:
-            raise ValueError(f"Program '{name}' not found")
+            raise ValueError(f"Program not found: {name}")
         
         fd = self.lib.bpf_program__fd(prog)
         if fd < 0:
-            raise ValueError(f"Program '{name}' has invalid fd")
+            raise ValueError(f"Invalid program fd: {name}")
         return fd
     
     def get_map_fd(self, obj, name):
-        """Get file descriptor for a BPF map by name."""
-        bpf_map = self.lib.bpf_object__find_map_by_name(obj, name.encode())
-        if not bpf_map:
-            raise ValueError(f"Map '{name}' not found")
+        """Get the file descriptor for a BPF map by name."""
+        m = self.lib.bpf_object__find_map_by_name(obj, name.encode())
+        if not m:
+            raise ValueError(f"Map not found: {name}")
         
-        fd = self.lib.bpf_map__fd(bpf_map)
+        fd = self.lib.bpf_map__fd(m)
         if fd < 0:
-            raise ValueError(f"Map '{name}' has invalid fd")
+            raise ValueError(f"Invalid map fd: {name}")
         return fd
 
 
 # ============================================================================
 # BPF Map Operations
+#
+# Uses the bpf() syscall directly to read entries from BPF maps.
 # ============================================================================
 
-# Load libc once for syscalls
+# Cache libc to avoid reloading on each syscall
 _libc = ctypes.CDLL(None, use_errno=True)
 
 
 class _BpfMapAttr(ctypes.Structure):
-    """Attribute structure for BPF map syscalls."""
+    """
+    Attribute structure for BPF map syscalls.
+    
+    This matches the kernel's bpf_attr union for map operations.
+    See: linux/bpf.h
+    """
     _fields_ = [
-        ("map_fd", ctypes.c_uint32),
-        ("_pad0", ctypes.c_uint32),
-        ("key", ctypes.c_uint64),
-        ("value_or_next", ctypes.c_uint64),  # value for lookup, next_key for get_next
+        ("map_fd", ctypes.c_uint32),    # File descriptor of the map
+        ("_pad", ctypes.c_uint32),      # Padding for alignment
+        ("key_ptr", ctypes.c_uint64),   # Pointer to key buffer
+        ("val_ptr", ctypes.c_uint64),   # Pointer to value/next_key buffer
     ]
 
 
-def _bpf_map_lookup(map_fd, key_buf, value_buf):
-    """Look up an element in a BPF map. Returns True if found."""
-    attr = _BpfMapAttr()
-    attr.map_fd = map_fd
-    attr.key = ctypes.addressof(key_buf)
-    attr.value_or_next = ctypes.addressof(value_buf)
+def _bpf_map_syscall(cmd, map_fd, key_ptr, val_ptr):
+    """
+    Execute a BPF map syscall.
     
-    return _libc.syscall(__NR_bpf, BPF_MAP_LOOKUP_ELEM, 
-                         ctypes.byref(attr), ctypes.sizeof(attr)) >= 0
-
-
-def _bpf_map_get_next_key(map_fd, key_buf, next_key_buf, is_first):
-    """Get the next key in a BPF map. Returns True if found."""
-    attr = _BpfMapAttr()
-    attr.map_fd = map_fd
-    attr.key = 0 if is_first else ctypes.addressof(key_buf)
-    attr.value_or_next = ctypes.addressof(next_key_buf)
+    Args:
+        cmd: BPF_MAP_LOOKUP_ELEM or BPF_MAP_GET_NEXT_KEY
+        map_fd: Map file descriptor
+        key_ptr: Address of key buffer (or 0 for first key)
+        val_ptr: Address of value buffer (lookup) or next_key buffer (iterate)
     
-    return _libc.syscall(__NR_bpf, BPF_MAP_GET_NEXT_KEY,
-                         ctypes.byref(attr), ctypes.sizeof(attr)) >= 0
+    Returns:
+        True on success, False on error (e.g., key not found, no more keys)
+    """
+    attr = _BpfMapAttr(
+        map_fd=map_fd,
+        key_ptr=key_ptr,
+        val_ptr=val_ptr
+    )
+    ret = _libc.syscall(__NR_bpf, cmd, ctypes.byref(attr), ctypes.sizeof(attr))
+    return ret >= 0
 
 
 def iterate_map(map_fd):
     """
-    Iterate over all entries in a BPF hash map.
+    Read all entries from a BPF hash map.
     
-    Returns list of (FlowKey, PacketMetrics) tuples.
+    Uses BPF_MAP_GET_NEXT_KEY to iterate through keys,
+    and BPF_MAP_LOOKUP_ELEM to get the value for each key.
+    
+    Returns:
+        List of (FlowKey, PacketMetrics) tuples
     """
     entries = []
     
-    # Buffers for keys and values
+    # Working buffers (reused during iteration)
     key = FlowKey()
     next_key = FlowKey()
     value = PacketMetrics()
     
-    # Get first key
-    if not _bpf_map_get_next_key(map_fd, key, next_key, is_first=True):
+    # Get the first key by passing NULL (0) as the current key
+    if not _bpf_map_syscall(BPF_MAP_GET_NEXT_KEY, map_fd, 0, ctypes.addressof(next_key)):
         return entries  # Map is empty
     
     while True:
-        # Copy next_key to key for lookup
-        ctypes.memmove(ctypes.addressof(key), ctypes.addressof(next_key), 
-                       ctypes.sizeof(FlowKey))
+        # Move next_key to key for the lookup
+        ctypes.pointer(key)[0] = next_key
         
-        # Look up the value
-        if _bpf_map_lookup(map_fd, key, value):
-            # Make copies of the data
-            key_copy = FlowKey()
-            value_copy = PacketMetrics()
-            ctypes.memmove(ctypes.addressof(key_copy), ctypes.addressof(key),
-                           ctypes.sizeof(FlowKey))
-            ctypes.memmove(ctypes.addressof(value_copy), ctypes.addressof(value),
-                           ctypes.sizeof(PacketMetrics))
-            entries.append((key_copy, value_copy))
+        # Look up the value for this key
+        if _bpf_map_syscall(BPF_MAP_LOOKUP_ELEM, map_fd,
+                           ctypes.addressof(key), ctypes.addressof(value)):
+            # Create copies to store (the buffers get overwritten)
+            entries.append((
+                FlowKey.from_buffer_copy(bytes(key)),
+                PacketMetrics.from_buffer_copy(bytes(value))
+            ))
         
-        # Get next key
-        if not _bpf_map_get_next_key(map_fd, key, next_key, is_first=False):
+        # Get the next key (using current key as reference)
+        if not _bpf_map_syscall(BPF_MAP_GET_NEXT_KEY, map_fd,
+                               ctypes.addressof(key), ctypes.addressof(next_key)):
             break  # No more keys
     
     return entries
 
 
 # ============================================================================
-# Helper Functions
+# Display Helpers
 # ============================================================================
 
 def format_ip(ip_int):
-    """Convert 32-bit integer to dotted decimal (e.g., "192.168.1.1")."""
+    """Convert 32-bit integer to dotted decimal (e.g., "127.0.0.1")."""
+    # IP is in network byte order, pack as-is
     return socket.inet_ntoa(struct.pack("I", ip_int))
 
 
@@ -264,18 +288,19 @@ def format_port(port_int):
 
 
 def get_interfaces():
-    """List available network interfaces."""
-    net_dir = "/sys/class/net"
-    if os.path.exists(net_dir):
-        return sorted(os.listdir(net_dir))
-    return []
+    """Get list of available network interfaces."""
+    try:
+        return sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return []
 
 
 # ============================================================================
 # Main Program
 # ============================================================================
 
-keep_running = True  # Global flag for signal handler
+# Global flag for clean shutdown
+keep_running = True
 
 
 def signal_handler(sig, frame):
@@ -289,7 +314,7 @@ def main():
     global keep_running
     
     # -------------------------------------------------------------------------
-    # Parse arguments
+    # Parse command-line arguments
     # -------------------------------------------------------------------------
     parser = argparse.ArgumentParser(description="eBPF Socket Hook Monitor")
     parser.add_argument("--bpf-file", default=".output/socket_hook.o",
@@ -304,18 +329,15 @@ def main():
     # Validate prerequisites
     # -------------------------------------------------------------------------
     if os.geteuid() != 0:
-        print("ERROR: Run as root (sudo)")
-        sys.exit(1)
+        sys.exit("ERROR: Run as root (sudo)")
     
     if not os.path.exists(args.bpf_file):
-        print(f"ERROR: {args.bpf_file} not found. Run 'make' first.")
-        sys.exit(1)
+        sys.exit(f"ERROR: {args.bpf_file} not found. Run 'make' first.")
     
     interfaces = get_interfaces()
     if args.interface not in interfaces:
-        print(f"ERROR: Interface '{args.interface}' not found")
-        print(f"Available: {', '.join(interfaces)}")
-        sys.exit(1)
+        sys.exit(f"ERROR: Interface '{args.interface}' not found. "
+                 f"Available: {', '.join(interfaces)}")
     
     # -------------------------------------------------------------------------
     # Display configuration
@@ -328,32 +350,41 @@ def main():
     print(f"Interval:  {args.interval}s")
     print()
     
-    # Set up signal handlers
+    # Set up signal handlers for clean shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     # -------------------------------------------------------------------------
     # Load BPF program and attach to socket
     # -------------------------------------------------------------------------
+    
+    # Initialize to None for cleanup in finally block
     bpf_obj = None
     sock = None
+    libbpf = None
     
     try:
+        # Load the compiled eBPF program
         print("Loading eBPF program...")
         libbpf = LibBPF()
-        
-        # Open and load the BPF object
         bpf_obj = libbpf.open_and_load(args.bpf_file)
         print("  ✓ Loaded into kernel")
         
-        # Get program and map file descriptors
+        # Get file descriptors for the program and map
         prog_fd = libbpf.get_program_fd(bpf_obj, "socket_packet_filter")
         map_fd = libbpf.get_map_fd(bpf_obj, "socket_metrics")
         print(f"  ✓ Program fd={prog_fd}, Map fd={map_fd}")
         
-        # Create raw socket and attach BPF filter
+        # Create a raw packet socket
+        # AF_PACKET: Layer 2 access
+        # SOCK_RAW: Include headers
+        # ETH_P_ALL: All protocols
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        
+        # Attach the BPF filter to the socket
         sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_BPF, struct.pack("I", prog_fd))
+        
+        # Bind to the specified interface
         sock.bind((args.interface, 0))
         print(f"  ✓ Attached to {args.interface}")
         
@@ -371,9 +402,10 @@ def main():
             if not keep_running:
                 break
             
-            # Read flows from BPF map
+            # Read all flows from the BPF map
             flows = iterate_map(map_fd)
             
+            # Display flow statistics
             print("\n" + "-" * 60)
             print(f"Active flows: {len(flows)}")
             print("-" * 60)
@@ -382,32 +414,31 @@ def main():
                 print("No traffic captured yet. Try: ping 127.0.0.1")
                 continue
             
-            # Sort by packet count (descending)
+            # Sort by packet count (highest first)
             flows.sort(key=lambda x: x[1].packets_processed, reverse=True)
             
-            # Display top 10 flows
+            # Show top 10 flows
             for i, (key, val) in enumerate(flows[:10], 1):
                 proto = proto_names.get(key.proto, f"Proto-{key.proto}")
                 src = f"{format_ip(key.src_ip)}:{format_port(key.src_port)}"
                 dst = f"{format_ip(key.dst_ip)}:{format_port(key.dst_port)}"
                 print(f"{i:2}. {src} → {dst} ({proto})")
-                print(f"    Packets: {val.packets_processed:,}  Bytes: {val.bytes_processed:,}")
+                print(f"    Packets: {val.packets_processed:,}  "
+                      f"Bytes: {val.bytes_processed:,}")
     
-    except OSError as e:
-        print(f"\nERROR: {e}")
-        sys.exit(1)
+    except (OSError, ValueError) as e:
+        sys.exit(f"\nERROR: {e}")
     
     except Exception as e:
-        print(f"\nERROR: {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        sys.exit(f"\nERROR: {e}")
     
     finally:
-        # Cleanup
+        # Clean up resources
         if sock:
             sock.close()
-        if bpf_obj:
+        if bpf_obj and libbpf:
             libbpf.close(bpf_obj)
     
     print("\n" + "=" * 60)
