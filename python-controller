@@ -1,426 +1,419 @@
 #!/usr/bin/env python3
 """
-Socket Hook Monitor with Packet Capture
+Socket Hook Monitor
 
-This program loads the socket_hook.o eBPF program and attaches it to a network
-interface to capture and analyze packet flows. It displays per-flow statistics
-including packet counts, byte counts, and protocol information.
+Loads a pre-compiled eBPF socket filter using libbpf and displays packet statistics.
 
 Usage:
-    sudo python3 python-controller --interface eth0 --interval 5
+    sudo python3 python-controller --interface lo
 
 Requirements:
-    - BCC (BPF Compiler Collection) Python bindings
+    - libbpf: sudo apt-get install libbpf-dev
     - Root privileges (sudo)
-    - Compiled socket_hook.o eBPF program
+    - Compiled eBPF program: make
 """
 
-from bcc import BPF
 import argparse
+import ctypes
+import ctypes.util
+import os
 import signal
-import sys
-import time
 import socket
 import struct
-import os
-
-# Global flag for graceful shutdown on Ctrl+C
-# This allows the signal handler to communicate with the main loop
-keep_running = True
-
-# Global socket reference for cleanup
-# We need this to properly close the socket in the finally block
-raw_socket = None
+import sys
+import time
 
 
-def signal_handler(sig, frame):
+# ============================================================================
+# Constants
+# ============================================================================
+
+SO_ATTACH_BPF = 50       # Socket option to attach BPF program
+ETH_P_ALL = 0x0003       # Capture all ethernet protocols
+BPF_MAP_LOOKUP_ELEM = 1  # BPF syscall: lookup map element
+BPF_MAP_GET_NEXT_KEY = 4 # BPF syscall: get next map key
+__NR_bpf = 321           # BPF syscall number (x86_64)
+
+
+# ============================================================================
+# Data Structures (must match common.h)
+# ============================================================================
+
+class FlowKey(ctypes.Structure):
     """
-    Handle interrupt signals (Ctrl+C) for graceful shutdown.
+    5-tuple flow identifier - matches struct flow_key in common.h
     
-    When the user presses Ctrl+C, this function sets the keep_running flag
-    to False, which causes the main monitoring loop to exit cleanly.
-    
-    Args:
-        sig: Signal number (e.g., SIGINT = 2)
-        frame: Current stack frame (not used)
+    Total size: 16 bytes
     """
-    global keep_running
-    print("\n\nReceived interrupt signal. Shutting down gracefully...")
-    keep_running = False
+    _fields_ = [
+        ("src_ip", ctypes.c_uint32),     # Source IPv4 address
+        ("dst_ip", ctypes.c_uint32),     # Destination IPv4 address
+        ("src_port", ctypes.c_uint16),   # Source port
+        ("dst_port", ctypes.c_uint16),   # Destination port
+        ("proto", ctypes.c_uint8),       # Protocol (TCP=6, UDP=17, ICMP=1)
+        ("_pad", ctypes.c_uint8 * 3),    # Padding for alignment
+    ]
 
+
+class PacketMetrics(ctypes.Structure):
+    """
+    Per-flow statistics - matches struct packet_metrics in common.h
+    
+    Note: 4 bytes of padding after packets_processed for 8-byte alignment.
+    Total size: 32 bytes
+    """
+    _fields_ = [
+        ("packets_processed", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint32),        # Implicit padding in C struct
+        ("bytes_processed", ctypes.c_uint64),
+        ("total_latency_ns", ctypes.c_uint64),
+        ("timestamp", ctypes.c_uint64),
+    ]
+
+
+# ============================================================================
+# libbpf Wrapper
+# ============================================================================
+
+class LibBPF:
+    """Minimal wrapper around libbpf shared library."""
+    
+    def __init__(self):
+        """Load libbpf and set up function signatures."""
+        # Find the libbpf shared library
+        lib_path = ctypes.util.find_library("bpf")
+        if not lib_path:
+            # Try common paths if find_library fails
+            for path in ["/usr/lib/x86_64-linux-gnu/libbpf.so.1",
+                         "/usr/lib/x86_64-linux-gnu/libbpf.so.0",
+                         "/usr/lib/libbpf.so.1",
+                         "/usr/lib/libbpf.so"]:
+                if os.path.exists(path):
+                    lib_path = path
+                    break
+        
+        if not lib_path:
+            raise OSError("libbpf not found. Install: sudo apt-get install libbpf-dev")
+        
+        self.lib = ctypes.CDLL(lib_path, use_errno=True)
+        self._define_functions()
+    
+    def _define_functions(self):
+        """Define C function signatures for type safety."""
+        # bpf_object *bpf_object__open(const char *path)
+        self.lib.bpf_object__open.argtypes = [ctypes.c_char_p]
+        self.lib.bpf_object__open.restype = ctypes.c_void_p
+        
+        # int bpf_object__load(struct bpf_object *obj)
+        self.lib.bpf_object__load.argtypes = [ctypes.c_void_p]
+        self.lib.bpf_object__load.restype = ctypes.c_int
+        
+        # void bpf_object__close(struct bpf_object *obj)
+        self.lib.bpf_object__close.argtypes = [ctypes.c_void_p]
+        self.lib.bpf_object__close.restype = None
+        
+        # struct bpf_program *bpf_object__find_program_by_name(obj, name)
+        self.lib.bpf_object__find_program_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self.lib.bpf_object__find_program_by_name.restype = ctypes.c_void_p
+        
+        # int bpf_program__fd(const struct bpf_program *prog)
+        self.lib.bpf_program__fd.argtypes = [ctypes.c_void_p]
+        self.lib.bpf_program__fd.restype = ctypes.c_int
+        
+        # struct bpf_map *bpf_object__find_map_by_name(obj, name)
+        self.lib.bpf_object__find_map_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self.lib.bpf_object__find_map_by_name.restype = ctypes.c_void_p
+        
+        # int bpf_map__fd(const struct bpf_map *map)
+        self.lib.bpf_map__fd.argtypes = [ctypes.c_void_p]
+        self.lib.bpf_map__fd.restype = ctypes.c_int
+    
+    def open_and_load(self, path):
+        """Open a BPF object file and load it into the kernel."""
+        obj = self.lib.bpf_object__open(path.encode())
+        if not obj:
+            raise OSError(f"Failed to open BPF object: {path}")
+        
+        ret = self.lib.bpf_object__load(obj)
+        if ret != 0:
+            self.lib.bpf_object__close(obj)
+            raise OSError(f"Failed to load BPF object (error {ret})")
+        
+        return obj
+    
+    def close(self, obj):
+        """Close a BPF object."""
+        if obj:
+            self.lib.bpf_object__close(obj)
+    
+    def get_program_fd(self, obj, name):
+        """Get file descriptor for a BPF program by name."""
+        prog = self.lib.bpf_object__find_program_by_name(obj, name.encode())
+        if not prog:
+            raise ValueError(f"Program '{name}' not found")
+        
+        fd = self.lib.bpf_program__fd(prog)
+        if fd < 0:
+            raise ValueError(f"Program '{name}' has invalid fd")
+        return fd
+    
+    def get_map_fd(self, obj, name):
+        """Get file descriptor for a BPF map by name."""
+        bpf_map = self.lib.bpf_object__find_map_by_name(obj, name.encode())
+        if not bpf_map:
+            raise ValueError(f"Map '{name}' not found")
+        
+        fd = self.lib.bpf_map__fd(bpf_map)
+        if fd < 0:
+            raise ValueError(f"Map '{name}' has invalid fd")
+        return fd
+
+
+# ============================================================================
+# BPF Map Operations
+# ============================================================================
+
+# Load libc once for syscalls
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+class _BpfMapAttr(ctypes.Structure):
+    """Attribute structure for BPF map syscalls."""
+    _fields_ = [
+        ("map_fd", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),
+        ("key", ctypes.c_uint64),
+        ("value_or_next", ctypes.c_uint64),  # value for lookup, next_key for get_next
+    ]
+
+
+def _bpf_map_lookup(map_fd, key_buf, value_buf):
+    """Look up an element in a BPF map. Returns True if found."""
+    attr = _BpfMapAttr()
+    attr.map_fd = map_fd
+    attr.key = ctypes.addressof(key_buf)
+    attr.value_or_next = ctypes.addressof(value_buf)
+    
+    return _libc.syscall(__NR_bpf, BPF_MAP_LOOKUP_ELEM, 
+                         ctypes.byref(attr), ctypes.sizeof(attr)) >= 0
+
+
+def _bpf_map_get_next_key(map_fd, key_buf, next_key_buf, is_first):
+    """Get the next key in a BPF map. Returns True if found."""
+    attr = _BpfMapAttr()
+    attr.map_fd = map_fd
+    attr.key = 0 if is_first else ctypes.addressof(key_buf)
+    attr.value_or_next = ctypes.addressof(next_key_buf)
+    
+    return _libc.syscall(__NR_bpf, BPF_MAP_GET_NEXT_KEY,
+                         ctypes.byref(attr), ctypes.sizeof(attr)) >= 0
+
+
+def iterate_map(map_fd):
+    """
+    Iterate over all entries in a BPF hash map.
+    
+    Returns list of (FlowKey, PacketMetrics) tuples.
+    """
+    entries = []
+    
+    # Buffers for keys and values
+    key = FlowKey()
+    next_key = FlowKey()
+    value = PacketMetrics()
+    
+    # Get first key
+    if not _bpf_map_get_next_key(map_fd, key, next_key, is_first=True):
+        return entries  # Map is empty
+    
+    while True:
+        # Copy next_key to key for lookup
+        ctypes.memmove(ctypes.addressof(key), ctypes.addressof(next_key), 
+                       ctypes.sizeof(FlowKey))
+        
+        # Look up the value
+        if _bpf_map_lookup(map_fd, key, value):
+            # Make copies of the data
+            key_copy = FlowKey()
+            value_copy = PacketMetrics()
+            ctypes.memmove(ctypes.addressof(key_copy), ctypes.addressof(key),
+                           ctypes.sizeof(FlowKey))
+            ctypes.memmove(ctypes.addressof(value_copy), ctypes.addressof(value),
+                           ctypes.sizeof(PacketMetrics))
+            entries.append((key_copy, value_copy))
+        
+        # Get next key
+        if not _bpf_map_get_next_key(map_fd, key, next_key, is_first=False):
+            break  # No more keys
+    
+    return entries
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
 
 def format_ip(ip_int):
-    """
-    Convert a 32-bit integer IP address to dotted decimal notation.
-    
-    IP addresses in the BPF maps are stored as 32-bit integers in network
-    byte order. This function converts them to human-readable format.
-    
-    Args:
-        ip_int: 32-bit integer representing an IPv4 address
-        
-    Returns:
-        String in format "192.168.1.1"
-        
-    Example:
-        format_ip(0x0100007f) -> "127.0.0.1"
-    """
-    # Pack as 32-bit integer, then unpack as 4 bytes for inet_ntoa
-    # 'I' format means unsigned int (32 bits)
+    """Convert 32-bit integer to dotted decimal (e.g., "192.168.1.1")."""
     return socket.inet_ntoa(struct.pack("I", ip_int))
 
 
 def format_port(port_int):
-    """
-    Convert port number from network byte order to host byte order.
-    
-    Ports in BPF maps are stored in network byte order (big-endian).
-    This function converts them to the host's native byte order for display.
-    
-    Args:
-        port_int: Port number in network byte order (16-bit)
-        
-    Returns:
-        Port number in host byte order (0-65535)
-        
-    Example:
-        format_port(0x5000) -> 80 (assuming big-endian network order)
-    """
+    """Convert port from network byte order to host byte order."""
     return socket.ntohs(port_int)
 
 
-def print_stats(bpf_prog):
-    """
-    Display statistics from the socket_metrics BPF map.
-    
-    This function reads all flow entries from the BPF hash map and displays
-    them in a human-readable format. Flows are sorted by packet count with
-    the most active flows shown first.
-    
-    Args:
-        bpf_prog: BPF program object containing the socket_metrics map
-        
-    Note:
-        Only displays the top 10 most active flows to keep output manageable.
-    """
-    # Access the socket_metrics map from the loaded BPF program
-    # BCC provides dict-like access to BPF maps
-    socket_metrics = bpf_prog["socket_metrics"]
-    
-    # Print header section
-    print("\n" + "=" * 70)
-    print(" Socket Hook Statistics")
-    print("=" * 70)
-    
-    # Check if any flows have been captured yet
-    if len(socket_metrics) == 0:
-        print("\nNo flows captured yet.")
-        print("Generate network traffic with: ping 8.8.8.8 or curl https://example.com")
-        print()
-        return
-    
-    # Convert BPF map items to list for sorting
-    # Each item is a tuple: (flow_key, packet_metrics)
-    flows = [(k, v) for k, v in socket_metrics.items()]
-    
-    # Sort flows by packet count in descending order (most active first)
-    # x[1] is the metrics struct, packets_processed is its first field
-    flows.sort(key=lambda x: x[1].packets_processed, reverse=True)
-    
-    # Display summary information
-    print(f"\nTotal active flows: {len(flows)}")
-    print(f"Showing top {min(len(flows), 10)} flows by packet count:\n")
-    
-    # Mapping of IP protocol numbers to readable names
-    # See: /etc/protocols or RFC 5237
-    protocol_names = {
-        1: "ICMP",    # Internet Control Message Protocol
-        6: "TCP",     # Transmission Control Protocol
-        17: "UDP",    # User Datagram Protocol
-        41: "IPv6",   # IPv6 encapsulation
-        47: "GRE",    # Generic Routing Encapsulation
-        50: "ESP",    # Encapsulating Security Payload
-    }
-    
-    # Display the top 10 most active flows
-    for i, (key, metrics) in enumerate(flows[:10], 1):
-        # Get human-readable protocol name, or show number if unknown
-        proto = protocol_names.get(key.proto, f"Proto-{key.proto}")
-        
-        # Format and display flow information
-        # Format: src_ip:src_port → dst_ip:dst_port (protocol)
-        print(f"Flow #{i}:")
-        print(f"  {format_ip(key.src_ip)}:{format_port(key.src_port)} → "
-              f"{format_ip(key.dst_ip)}:{format_port(key.dst_port)} ({proto})")
-        
-        # Display packet and byte statistics with thousand separators
-        print(f"  Packets: {metrics.packets_processed:,}")
-        print(f"  Bytes:   {metrics.bytes_processed:,}")
-        
-        # Calculate and display average packet size
-        # Use max() to avoid division by zero
-        avg_size = metrics.bytes_processed // max(metrics.packets_processed, 1)
-        print(f"  Average packet size: {avg_size} bytes")
-        print()  # Blank line between flows
-    
-    # Show indicator if there are more flows not displayed
-    if len(flows) > 10:
-        print(f"... and {len(flows) - 10} more flows not shown\n")
-
-
-def validate_interface(interface_name):
-    """
-    Check if a network interface exists on the system.
-    
-    Args:
-        interface_name: Name of the network interface (e.g., "eth0", "wlan0")
-        
-    Returns:
-        True if interface exists, False otherwise
-    """
-    try:
-        # Try to get the interface index; raises OSError if not found
-        socket.if_nametoindex(interface_name)
-        return True
-    except OSError:
-        return False
-
-
-def list_interfaces():
-    """
-    Get a list of all available network interfaces on the system.
-    
-    Returns:
-        List of interface names as strings
-    """
-    interfaces = []
-    # Read from /sys/class/net which contains all network interfaces
+def get_interfaces():
+    """List available network interfaces."""
     net_dir = "/sys/class/net"
     if os.path.exists(net_dir):
-        interfaces = os.listdir(net_dir)
-    return interfaces
+        return sorted(os.listdir(net_dir))
+    return []
+
+
+# ============================================================================
+# Main Program
+# ============================================================================
+
+keep_running = True  # Global flag for signal handler
+
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C for graceful shutdown."""
+    global keep_running
+    print("\n\nStopping...")
+    keep_running = False
 
 
 def main():
-    """
-    Main program entry point.
+    global keep_running
     
-    This function:
-    1. Parses command-line arguments
-    2. Validates prerequisites (root, interface exists, BPF file exists)
-    3. Loads the eBPF program and attaches it to a network interface
-    4. Monitors and displays packet statistics until interrupted
-    5. Cleans up resources on exit
-    """
-    global keep_running, raw_socket
-    
-    # Configure command-line argument parser
-    parser = argparse.ArgumentParser(
-        description="Socket Hook Monitor - Load and monitor eBPF socket filter",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Monitor eth0 interface, update every 5 seconds
-  sudo python3 python-controller --interface eth0 --interval 5
-  
-  # Monitor with custom BPF program location
-  sudo python3 python-controller --bpf-file custom/socket_hook.o
-  
-  # Quick monitoring with 2-second updates
-  sudo python3 python-controller -i 2
-
-Notes:
-  - Must be run as root (use sudo)
-  - Interface must exist and be up
-  - BPF program must be compiled first (run 'make')
-        """
-    )
-    
-    parser.add_argument(
-        "--bpf-file",
-        default=".output/socket_hook.o",
-        help="Path to compiled eBPF object file (default: .output/socket_hook.o)"
-    )
-    
-    parser.add_argument(
-        "-i", "--interval",
-        type=int,
-        default=5,
-        help="Statistics display interval in seconds (default: 5)"
-    )
-    
-    parser.add_argument(
-        "--interface",
-        default="eth0",
-        help="Network interface to monitor (default: eth0)"
-    )
-    
-    # Parse command-line arguments
+    # -------------------------------------------------------------------------
+    # Parse arguments
+    # -------------------------------------------------------------------------
+    parser = argparse.ArgumentParser(description="eBPF Socket Hook Monitor")
+    parser.add_argument("--bpf-file", default=".output/socket_hook.o",
+                        help="Path to compiled eBPF object")
+    parser.add_argument("--interface", default="lo",
+                        help="Network interface to monitor")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+                        help="Update interval in seconds")
     args = parser.parse_args()
     
-    # ========================================================================
-    # Pre-flight checks: Verify prerequisites before attempting to load BPF
-    # ========================================================================
-    
-    # Check 1: Root privileges required
+    # -------------------------------------------------------------------------
+    # Validate prerequisites
+    # -------------------------------------------------------------------------
     if os.geteuid() != 0:
-        print("ERROR: This program must be run as root")
-        print("       eBPF programs require root privileges to load into the kernel")
-        print("\nUsage: sudo python3 python-controller")
+        print("ERROR: Run as root (sudo)")
         sys.exit(1)
     
-    # Check 2: BPF object file exists
     if not os.path.exists(args.bpf_file):
-        print(f"ERROR: BPF object file not found: {args.bpf_file}")
-        print("\nDid you compile the eBPF program?")
-        print("Run: make")
+        print(f"ERROR: {args.bpf_file} not found. Run 'make' first.")
         sys.exit(1)
     
-    # Check 3: Network interface exists
-    if not validate_interface(args.interface):
-        print(f"ERROR: Network interface '{args.interface}' not found")
-        print("\nAvailable interfaces:")
-        for iface in list_interfaces():
-            print(f"  - {iface}")
-        print("\nSpecify a valid interface with: --interface <name>")
+    interfaces = get_interfaces()
+    if args.interface not in interfaces:
+        print(f"ERROR: Interface '{args.interface}' not found")
+        print(f"Available: {', '.join(interfaces)}")
         sys.exit(1)
     
-    # Check 4: Validate interval is positive
-    if args.interval <= 0:
-        print("ERROR: Interval must be a positive number")
-        sys.exit(1)
-    
-    # Display startup banner
-    print("=" * 70)
-    print(" Socket Hook Monitor - eBPF Packet Capture")
-    print("=" * 70)
-    print(f"\nConfiguration:")
-    print(f"  BPF Program:  {args.bpf_file}")
-    print(f"  Interface:    {args.interface}")
-    print(f"  Update Interval: {args.interval} seconds")
+    # -------------------------------------------------------------------------
+    # Display configuration
+    # -------------------------------------------------------------------------
+    print("=" * 60)
+    print("Socket Hook Monitor")
+    print("=" * 60)
+    print(f"BPF File:  {args.bpf_file}")
+    print(f"Interface: {args.interface}")
+    print(f"Interval:  {args.interval}s")
     print()
     
-    # Set up signal handler for graceful Ctrl+C handling
-    # This must be done before loading the BPF program
+    # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    # -------------------------------------------------------------------------
+    # Load BPF program and attach to socket
+    # -------------------------------------------------------------------------
+    bpf_obj = None
+    sock = None
+    
     try:
-        # ====================================================================
-        # Load and attach eBPF program
-        # ====================================================================
-        
         print("Loading eBPF program...")
+        libbpf = LibBPF()
         
-        # Load the compiled BPF object file
-        # BCC reads the .o file and loads all programs and maps
-        b = BPF(src_file=args.bpf_file)
-        print("  ✓ BPF object loaded")
+        # Open and load the BPF object
+        bpf_obj = libbpf.open_and_load(args.bpf_file)
+        print("  ✓ Loaded into kernel")
         
-        # Find and load the socket filter function
-        # This must match the SEC("socket_filter") function name in socket_hook.c
-        fn = b.load_func("socket_packet_filter", BPF.SOCKET_FILTER)
-        print("  ✓ Socket filter function found")
+        # Get program and map file descriptors
+        prog_fd = libbpf.get_program_fd(bpf_obj, "socket_packet_filter")
+        map_fd = libbpf.get_map_fd(bpf_obj, "socket_metrics")
+        print(f"  ✓ Program fd={prog_fd}, Map fd={map_fd}")
         
-        # Create a raw packet socket
-        # AF_PACKET: Low-level packet interface
-        # SOCK_RAW: Raw packets including link-level header
-        # 0x0003: ETH_P_ALL in network byte order (capture all protocols)
-        raw_socket = socket.socket(
-            socket.AF_PACKET,    # Address family: packet interface
-            socket.SOCK_RAW,     # Socket type: raw packets
-            socket.htons(0x0003) # Protocol: ETH_P_ALL (all protocols)
-        )
-        print("  ✓ Raw packet socket created")
+        # Create raw socket and attach BPF filter
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_BPF, struct.pack("I", prog_fd))
+        sock.bind((args.interface, 0))
+        print(f"  ✓ Attached to {args.interface}")
         
-        # Attach the BPF program to the socket
-        # SO_ATTACH_BPF: Socket option to attach a BPF filter
-        # fn.fd: File descriptor of the loaded BPF program
-        raw_socket.setsockopt(
-            socket.SOL_SOCKET,      # Socket level option
-            socket.SO_ATTACH_BPF,   # Attach BPF filter
-            fn.fd                   # BPF program file descriptor
-        )
-        print("  ✓ BPF filter attached to socket")
+        # ---------------------------------------------------------------------
+        # Monitoring loop
+        # ---------------------------------------------------------------------
+        print("\n" + "=" * 60)
+        print("Monitoring... Press Ctrl+C to stop")
+        print("=" * 60)
         
-        # Bind socket to the specific network interface
-        # This ensures we only capture packets from the specified interface
-        raw_socket.bind((args.interface, 0))
-        print(f"  ✓ Socket bound to interface {args.interface}")
+        proto_names = {1: "ICMP", 6: "TCP", 17: "UDP"}
         
-        print("\n" + "=" * 70)
-        print("Packet capture is now active!")
-        print("Press Ctrl+C to stop and exit")
-        print("=" * 70)
-        
-        # ====================================================================
-        # Main monitoring loop
-        # ====================================================================
-        
-        # Continuously display statistics until interrupted
         while keep_running:
-            # Sleep for the specified interval
             time.sleep(args.interval)
+            if not keep_running:
+                break
             
-            # Display current statistics from BPF maps
-            print_stats(b)
-        
-    except PermissionError:
-        # Shouldn't reach here due to earlier root check, but just in case
-        print("\nERROR: Permission denied")
-        print("Make sure you're running with sudo")
-        sys.exit(1)
-        
+            # Read flows from BPF map
+            flows = iterate_map(map_fd)
+            
+            print("\n" + "-" * 60)
+            print(f"Active flows: {len(flows)}")
+            print("-" * 60)
+            
+            if not flows:
+                print("No traffic captured yet. Try: ping 127.0.0.1")
+                continue
+            
+            # Sort by packet count (descending)
+            flows.sort(key=lambda x: x[1].packets_processed, reverse=True)
+            
+            # Display top 10 flows
+            for i, (key, val) in enumerate(flows[:10], 1):
+                proto = proto_names.get(key.proto, f"Proto-{key.proto}")
+                src = f"{format_ip(key.src_ip)}:{format_port(key.src_port)}"
+                dst = f"{format_ip(key.dst_ip)}:{format_port(key.dst_port)}"
+                print(f"{i:2}. {src} → {dst} ({proto})")
+                print(f"    Packets: {val.packets_processed:,}  Bytes: {val.bytes_processed:,}")
+    
     except OSError as e:
-        # Handle socket-related errors (interface issues, etc.)
         print(f"\nERROR: {e}")
-        print(f"Failed to work with interface '{args.interface}'")
-        print("\nTroubleshooting:")
-        print("  1. Verify interface exists: ip link show")
-        print("  2. Verify interface is up: sudo ip link set {args.interface} up")
         sys.exit(1)
-        
-    except KeyError as e:
-        # Handle missing BPF map/function errors
-        print(f"\nERROR: Could not find BPF object: {e}")
-        print("Make sure socket_hook.o was compiled correctly")
-        print("Expected BPF objects:")
-        print("  - Function: socket_packet_filter")
-        print("  - Map: socket_metrics")
-        sys.exit(1)
-        
+    
     except Exception as e:
-        # Catch-all for unexpected errors
-        print(f"\nERROR: Unexpected error occurred")
-        print(f"Details: {e}")
-        print("\nStack trace:")
+        print(f"\nERROR: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-        
+    
     finally:
-        # ====================================================================
-        # Cleanup: Always executed, even on error or interrupt
-        # ====================================================================
-        
-        print("\n" + "=" * 70)
-        print("Cleaning up resources...")
-        
-        # Close the raw socket if it was created
-        if raw_socket is not None:
-            try:
-                raw_socket.close()
-                print("  ✓ Socket closed")
-            except Exception as e:
-                print(f"  ⚠ Warning: Failed to close socket: {e}")
-        
-        # BCC automatically cleans up BPF programs when the object is destroyed
-        print("  ✓ BPF program detached")
-        print("\nShutdown complete. Goodbye!")
-        print("=" * 70)
+        # Cleanup
+        if sock:
+            sock.close()
+        if bpf_obj:
+            libbpf.close(bpf_obj)
+    
+    print("\n" + "=" * 60)
+    print("Goodbye!")
+    print("=" * 60)
 
 
-# Standard Python idiom: only run main() if this script is executed directly
-# (not if it's imported as a module)
 if __name__ == "__main__":
     main()

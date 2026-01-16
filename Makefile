@@ -7,6 +7,13 @@
 # eBPF bytecode that can be loaded into the Linux kernel.
 #
 
+
+
+# WARNING: you have to use TABS and not SPACES for indenting!
+
+
+
+
 #
 # Build Configuration Variables
 #
@@ -18,8 +25,6 @@ CLANG ?= clang
 LLC ?= llc
 STRIP ?= llvm-strip
 
-# VMLINUX_BTF: Path to kernel BTF (not actually used, legacy variable)
-VMLINUX_BTF := $(OUTPUT)/vmlinux.btf
 
 # LIBBPF_DIR: Location of libbpf headers (standard system location)
 # SAFE: Only used for include paths, no write operations
@@ -29,7 +34,7 @@ LIBBPF_DIR := /usr
 # -I$(OUTPUT): For generated vmlinux.h
 # -I$(LIBBPF_DIR)/include/bpf: For bpf_helpers.h, bpf_endian.h
 # -Isrc/ebpf: For our common.h
-INCLUDES := -I$(OUTPUT) -I$(LIBBPF_DIR)/include/bpf -Isrc/ebpf
+INCLUDES := -I. -I$(OUTPUT) -I$(LIBBPF_DIR)/include/bpf -Isrc/ebpf
 
 #
 # Auto-detect clang system includes for BPF compilation
@@ -43,15 +48,15 @@ INCLUDES := -I$(OUTPUT) -I$(LIBBPF_DIR)/include/bpf -Isrc/ebpf
 # 3. awk formats each path as "-isystem<path>"
 #
 CLANG_BPF_SYS_INCLUDES = $(shell clang -v -E - </dev/null 2>&1 | \
-    sed -n '/^\#include <...>/,/^End/p' | \
-    sed '/^\#include/d;/^End/d' | \
-    awk '{printf "-isystem%s ", $$0}')
+	sed -n '/^\#include <...>/,/^End/p' | \
+	sed '/^\#include/d;/^End/d' | \
+	awk '{printf "-isystem%s ", $$0}')
 
 #
 # Source and Object File Definitions
 #
 # BPF_SOURCES: All eBPF C source files to compile
-BPF_SOURCES := src/ebpf/xdp_hook.c src/ebpf/tc_hook.c src/ebpf/socket_hook.c
+BPF_SOURCES := src/ebpf/socket_hook.c
 
 # BPF_OBJS: Corresponding output object files (.o)
 # Pattern substitution: src/ebpf/foo.c -> .output/foo.o
@@ -62,12 +67,12 @@ BPF_OBJS := $(patsubst src/ebpf/%.c,$(OUTPUT)/%.o,$(BPF_SOURCES))
 #
 .PHONY: all
 all: vmlinux.h $(BPF_OBJS)
-    @echo ""
-    @echo "Build complete! Generated files:"
-    @echo "  vmlinux.h - Kernel type definitions"
-    @echo "  $(BPF_OBJS)"
-    @echo ""
-    @echo "To load these programs, you'll need a userspace loader."
+	@echo ""
+	@echo "Build complete! Generated files:"
+	@echo "  vmlinux.h - Kernel type definitions"
+	@echo "  $(BPF_OBJS)"
+	@echo ""
+	@echo "To load these programs, you'll need a userspace loader."
 
 #
 # Generate vmlinux.h - Kernel Type Definitions
@@ -83,12 +88,12 @@ all: vmlinux.h $(BPF_OBJS)
 # rather than creating an empty/broken vmlinux.h.
 #
 vmlinux.h: /sys/kernel/btf/vmlinux
-    @echo "Generating vmlinux.h from kernel BTF..."
-    @bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h || \
-        (echo "ERROR: Failed to generate vmlinux.h. Is bpftool installed?" && \
-         echo "Install with: sudo apt-get install linux-tools-generic" && \
-         rm -f vmlinux.h && exit 1)
-    @echo "Generated vmlinux.h (kernel type definitions)"
+	@echo "Generating vmlinux.h from kernel BTF..."
+	@bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/ebpf/vmlinux.h || \
+		(echo "ERROR: Failed to generate vmlinux.h. Is bpftool installed?" && \
+		echo "Install with: sudo apt-get install linux-tools-generic" && \
+		rm -f src/ebpf/vmlinux.h && exit 1)
+	@echo "Generated vmlinux.h (kernel type definitions)"
 
 #
 # Create Output Directory
@@ -97,8 +102,8 @@ vmlinux.h: /sys/kernel/btf/vmlinux
 # No system directories are touched
 #
 $(OUTPUT):
-    @echo "Creating output directory: $(OUTPUT)"
-    @mkdir -p $(OUTPUT)
+	@echo "Creating output directory: $(OUTPUT)"
+	@mkdir -p $(OUTPUT)
 
 #
 # Compile eBPF Programs
@@ -120,14 +125,14 @@ $(OUTPUT):
 # STRIP removes debug symbols to reduce object file size
 # -g: Remove debug information only, doesn't affect functionality
 #
-$(OUTPUT)/%.o: src/ebpf/%.c vmlinux.h common.h | $(OUTPUT)
-    @echo "Compiling $< -> $@"
-    @$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_x86 \
-        $(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) \
-        -Wall -Werror \
-        -c $< -o $@
-    @$(STRIP) -g $@
-    @echo "  Compiled and stripped $@"
+$(OUTPUT)/%.o: src/ebpf/%.c src/ebpf/vmlinux.h src/ebpf/common.h | $(OUTPUT)
+	@echo "Compiling $< -> $@"
+	@$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_x86 \
+		$(INCLUDES) $(CLANG_BPF_SYS_INCLUDES) \
+		-Wall -Werror \
+		-c $< -o $@
+	@$(STRIP) -g $@
+	@echo "  Compiled and stripped $@"
 
 #
 # Clean Build Artifacts
@@ -145,10 +150,10 @@ $(OUTPUT)/%.o: src/ebpf/%.c vmlinux.h common.h | $(OUTPUT)
 #
 .PHONY: clean
 clean:
-    @echo "Cleaning build artifacts..."
-    @rm -rf $(OUTPUT)
-    @rm -f vmlinux.h
-    @echo "Clean complete"
+	@echo "Cleaning build artifacts..."
+	@rm -rf $(OUTPUT)
+	@rm -f src/ebpf/vmlinux.h
+	@echo "Clean complete"
 
 #
 # Verify Build Environment
@@ -158,41 +163,38 @@ clean:
 #
 .PHONY: check-deps
 check-deps:
-    @echo "Checking build dependencies..."
-    @command -v clang >/dev/null 2>&1 || \
-        (echo "ERROR: clang not found. Install with: sudo apt-get install clang" && exit 1)
-    @command -v llvm-strip >/dev/null 2>&1 || \
-        (echo "ERROR: llvm-strip not found. Install with: sudo apt-get install llvm" && exit 1)
-    @command -v bpftool >/dev/null 2>&1 || \
-        (echo "ERROR: bpftool not found. Install with: sudo apt-get install linux-tools-generic" && exit 1)
-    @test -d $(LIBBPF_DIR)/include/bpf || \
-        (echo "ERROR: libbpf headers not found. Install with: sudo apt-get install libbpf-dev" && exit 1)
-    @test -f /sys/kernel/btf/vmlinux || \
-        (echo "ERROR: Kernel BTF not available. You need a kernel with CONFIG_DEBUG_INFO_BTF=y" && exit 1)
-    @echo "All dependencies satisfied!"
+	@echo "Checking build dependencies..."
+	@command -v clang >/dev/null 2>&1 || \
+		(echo "ERROR: clang not found. Install with: sudo apt-get install clang" && exit 1)
+	@command -v llvm-strip >/dev/null 2>&1 || \
+		(echo "ERROR: llvm-strip not found. Install with: sudo apt-get install llvm" && exit 1)
+	@command -v bpftool >/dev/null 2>&1 || \
+		(echo "ERROR: bpftool not found. Install with: sudo apt-get install linux-tools-generic" && exit 1)
+	@test -d $(LIBBPF_DIR)/include/bpf || \
+		(echo "ERROR: libbpf headers not found. Install with: sudo apt-get install libbpf-dev" && exit 1)
+	@test -f /sys/kernel/btf/vmlinux || \
+		(echo "ERROR: Kernel BTF not available. You need a kernel with CONFIG_DEBUG_INFO_BTF=y" && exit 1)
+	@echo "All dependencies satisfied!"
 
 #
 # Help Target
 #
 .PHONY: help
 help:
-    @echo "eBPF Hook Point Comparison - Build System"
-    @echo ""
-    @echo "Usage: make [target]"
-    @echo ""
-    @echo "Targets:"
-    @echo "  all        - Build all eBPF programs (default)"
-    @echo "  check-deps - Verify build dependencies are installed"
-    @echo "  clean      - Remove build artifacts (safe: only touches .output/ and vmlinux.h)"
-    @echo "  help       - Show this help message"
-    @echo ""
-    @echo "Build artifacts:"
-    @echo "  .output/xdp_hook.o    - XDP hook eBPF bytecode"
-    @echo "  .output/tc_hook.o     - TC hook eBPF bytecode"
-    @echo "  .output/socket_hook.o - Socket hook eBPF bytecode"
-    @echo "  vmlinux.h             - Kernel type definitions"
-    @echo ""
-    @echo "Safety notes:"
-    @echo "  - All output confined to project directory"
-    @echo "  - No system files modified"
-    @echo "  - 'make clean' only removes build artifacts"
+	@echo "eBPF Hook Point Comparison - Build System"
+	@echo ""
+	@echo "Usage: make [target]"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all        - Build all eBPF programs (default)"
+	@echo "  check-deps - Verify build dependencies are installed"
+	@echo "  clean      - Remove build artifacts (safe: only touches .output/ and vmlinux.h)"
+	@echo "  help       - Show this help message"
+	@echo ""
+	@echo "Build artifacts:"
+	@echo "  .output/socket_hook.o - Socket hook eBPF bytecode"
+	@echo ""
+	@echo "Safety notes:"
+	@echo "  - All output confined to project directory"
+	@echo "  - No system files modified"
+	@echo "  - 'make clean' only removes build artifacts"
