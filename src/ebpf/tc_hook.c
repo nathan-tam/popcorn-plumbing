@@ -1,34 +1,57 @@
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 /*
- * TC (Traffic Control) Layer eBPF Hook
- * 
- * Attaches to the TC ingress/egress hook point to monitor packets.
- * Unlike socket filters, TC programs can use direct packet access
- * (data/data_end pointers) for more efficient packet parsing.
- * 
- * Attachment:
- *   tc qdisc add dev <iface> clsact
- *   tc filter add dev <iface> ingress bpf direct-action obj tc_hook.o sec tc_ingress
- *   tc filter add dev <iface> egress bpf direct-action obj tc_hook.o sec tc_egress
+ * TC (Traffic Control) Layer eBPF Hook - CORRECTED
+ * * Attaches to the TC ingress/egress hook point to monitor packets.
+ * Now supports VLANs and properly parses Ethernet headers.
  */
 
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
-#include "common.h"
 
-/* Protocol numbers */
-#define ETH_P_IP    0x0800
+#include "common.h" // <-- use shared structs (flow_key, packet_metrics) expected by userspace
+
+// Some toolchains won't expose these via vmlinux.h alone.
+#ifndef IPPROTO_TCP
 #define IPPROTO_TCP 6
+#endif
+#ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
+#endif
 
-/* Header sizes */
-#define IP_HLEN_MIN 20
-#define IP_HLEN_MAX 60
+// IPv4 fragmentation bits (in frag_off, network order on the wire; use bpf_ntohs before masking)
+#ifndef IP_MF
+#define IP_MF 0x2000
+#endif
+#ifndef IP_OFFSET
+#define IP_OFFSET 0x1FFF
+#endif
 
-/* TC return values */
-#define TC_ACT_OK       0   /* Continue processing */
-#define TC_ACT_SHOT     2   /* Drop packet */
+// Packet parsing limits
+#define MAX_VLAN_DEPTH 2
+
+#define TC_ACT_OK    0
+/* ============================================================================
+ * Data Structures
+ * ============================================================================ */
+
+// PACKED ensures no compiler padding is inserted between fields.
+// This is critical for BPF map keys.
+struct flow_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  proto;
+    __u8  pad[3]; // Explicit padding to reach 4-byte alignment
+} __attribute__((packed));
+
+struct packet_metrics {
+    __u64 packets_processed;
+    __u64 bytes_processed;
+    __u64 total_latency_ns;
+    __u64 timestamp;
+};
 
 /* ============================================================================
  * BPF Maps
@@ -41,131 +64,185 @@ struct {
     __type(value, struct packet_metrics);
 } tc_metrics SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 8);
+    __type(key, __u32);
+    __type(value, __u64);
+} tc_debug SEC(".maps");
+
+// Debug Indicies
+enum {
+    DBG_TOTAL_PACKETS = 0,
+    DBG_NOT_IP,
+    DBG_IPV4_PACKETS,
+    DBG_PARSED_PACKETS,
+    DBG_MAP_UPDATES,
+    DBG_MAP_NOEXIST,
+    DBG_ERR_BOUNDS,
+    DBG_ERR_HEADER
+};
+
+static __always_inline void debug_inc(__u32 idx)
+{
+    __u64 *counter = bpf_map_lookup_elem(&tc_debug, &idx);
+    if (counter)
+        __sync_fetch_and_add(counter, 1);
+}
+
 /* ============================================================================
- * Packet Processing Helper
+ * Packet Processing
  * ============================================================================ */
 
-/*
- * Parse packet and update flow metrics.
- * 
- * This helper is shared between ingress and egress hooks to avoid
- * code duplication. Must be static inline for eBPF.
- * 
- * Returns: TC_ACT_OK (always continues processing)
- */
-static __always_inline int process_packet(struct __sk_buff *skb)
+SEC("tc")
+int tc_packet_filter(struct __sk_buff *skb)
 {
-    /* Get packet boundaries for direct access */
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
-    
-    /* Get packet length early */
-    __u32 pkt_len = skb->len;
-    if (pkt_len == 0)
-        return TC_ACT_OK;
 
-    /* --- Parse Ethernet Header --- */
+    debug_inc(DBG_TOTAL_PACKETS);
+
+    // 1. PARSE ETHERNET HEADER
     struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
+    if ((void *)(eth + 1) > data_end) {
+        debug_inc(DBG_ERR_BOUNDS);
         return TC_ACT_OK;
-    
-    /* Only process IPv4 */
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+    }
 
-    /* --- Parse IP Header --- */
-    struct iphdr *ip = (void *)(eth + 1);
-    if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
-    
-    /* 
-     * Validate IP header length.
-     * IHL field is 4 bits (0-15), multiply by 4 to get bytes.
-     * Valid range: 20-60 bytes.
-     */
-    __u32 ip_hlen = ip->ihl * 4;
-    if (ip_hlen < IP_HLEN_MIN || ip_hlen > IP_HLEN_MAX)
-        return TC_ACT_OK;
+    __u16 h_proto = eth->h_proto;
+    int l3_offset = sizeof(struct ethhdr);
 
-    /* Verify we can access the full IP header (including options) */
-    if ((__u8 *)ip + ip_hlen > (__u8 *)data_end)
-        return TC_ACT_OK;
-
-    /* Initialize flow key - ensure padding is zeroed for consistent lookups */
-    struct flow_key key = {
-        .src_ip = ip->saddr,
-        .dst_ip = ip->daddr,
-        .src_port = 0,
-        .dst_port = 0,
-        .proto = ip->protocol,
-        ._pad = {0, 0, 0},
-    };
-
-    /* --- Parse L4 Header (TCP/UDP ports) --- */
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (struct tcphdr *)((__u8 *)ip + ip_hlen);
-        if ((void *)(tcp + 1) <= data_end) {
-            key.src_port = tcp->source;
-            key.dst_port = tcp->dest;
-        }
-        /* If bounds check fails, ports stay 0 - still track flow by IP */
-    } 
-    else if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (struct udphdr *)((__u8 *)ip + ip_hlen);
-        if ((void *)(udp + 1) <= data_end) {
-            key.src_port = udp->source;
-            key.dst_port = udp->dest;
+    // 2. HANDLE VLANs (Loop unrolled for Verifier)
+    // We iterate to unwrap VLAN tags (802.1Q / 802.1AD) to find the real L3 protocol
+    #pragma unroll
+    for (int i = 0; i < MAX_VLAN_DEPTH; i++) {
+        if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
+            struct vlan_hdr *vhdr = data + l3_offset;
+            if ((void *)(vhdr + 1) > data_end) {
+                debug_inc(DBG_ERR_BOUNDS);
+                return TC_ACT_OK;
+            }
+            h_proto = vhdr->h_vlan_encapsulated_proto;
+            l3_offset += sizeof(struct vlan_hdr);
+        } else {
+            break; // Not a VLAN, stop looking
         }
     }
 
-    /* --- Update Flow Metrics --- */
-    struct packet_metrics *metrics = bpf_map_lookup_elem(&tc_metrics, &key);
-    
+    // 3. CHECK IF IT IS IPv4
+    if (h_proto != bpf_htons(ETH_P_IP)) {
+        debug_inc(DBG_NOT_IP);
+        return TC_ACT_OK;
+    }
+
+    debug_inc(DBG_IPV4_PACKETS);
+
+    // 4. PARSE IP HEADER
+    struct iphdr *ip = data + l3_offset;
+    if ((void *)(ip + 1) > data_end) {
+        debug_inc(DBG_ERR_BOUNDS);
+        return TC_ACT_OK;
+    }
+
+    // Verify IPv4
+    if (ip->version != 4) {
+        debug_inc(DBG_ERR_HEADER);
+        return TC_ACT_OK;
+    }
+
+    // Calculate dynamic IP header length (IHL * 4)
+    __u32 ip_hlen = ip->ihl * 4;
+    if (ip_hlen < 20 || ip_hlen > 60) {
+        debug_inc(DBG_ERR_HEADER);
+        return TC_ACT_OK;
+    }
+
+    // Ensure variable length IP header is within bounds
+    if ((void *)ip + ip_hlen > data_end) {
+        debug_inc(DBG_ERR_BOUNDS);
+        return TC_ACT_OK;
+    }
+
+    // Skip all IPv4 fragments (non-first fragments don't carry L4 headers reliably).
+    __u16 frag = bpf_ntohs(ip->frag_off);
+    if (frag & (IP_MF | IP_OFFSET)) {
+        debug_inc(DBG_ERR_HEADER);
+        return TC_ACT_OK;
+    }
+
+    // 5. INITIALIZE FLOW KEY
+    struct flow_key flow;
+    __builtin_memset(&flow, 0, sizeof(flow));
+
+    flow.src_ip = ip->saddr;
+    flow.dst_ip = ip->daddr;
+    flow.proto = ip->protocol;
+
+    // 6. PARSE L4 (TCP/UDP)
+    void *l4 = (void *)ip + ip_hlen;
+
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = l4;
+        if ((void *)(tcp + 1) <= data_end) {
+            flow.src_port = tcp->source;
+            flow.dst_port = tcp->dest;
+        }
+    } else if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = l4;
+        if ((void *)(udp + 1) <= data_end) {
+            flow.src_port = udp->source;
+            flow.dst_port = udp->dest;
+        }
+    }
+
+    debug_inc(DBG_PARSED_PACKETS);
+
+    // 7. UPDATE METRICS
+    __u32 pkt_len = skb->len;
+    __u64 now = bpf_ktime_get_ns();
+    struct packet_metrics *metrics = bpf_map_lookup_elem(&tc_metrics, &flow);
+
     if (metrics) {
-        /* Update existing entry atomically */
         __sync_fetch_and_add(&metrics->packets_processed, 1);
         __sync_fetch_and_add(&metrics->bytes_processed, pkt_len);
-        metrics->timestamp = bpf_ktime_get_ns();
+
+        // Accumulate inter-arrival time as a simple per-flow latency proxy.
+        __u64 last = metrics->timestamp;
+        if (last)
+            __sync_fetch_and_add(&metrics->total_latency_ns, now - last);
+
+        metrics->timestamp = now;
+        debug_inc(DBG_MAP_UPDATES);
     } else {
-        /* Create new entry */
         struct packet_metrics new_metrics = {
             .packets_processed = 1,
             .bytes_processed = pkt_len,
             .total_latency_ns = 0,
-            .timestamp = bpf_ktime_get_ns(),
+            .timestamp = now,
         };
-        bpf_map_update_elem(&tc_metrics, &key, &new_metrics, BPF_NOEXIST);
+
+        if (bpf_map_update_elem(&tc_metrics, &flow, &new_metrics, BPF_NOEXIST) == 0) {
+            debug_inc(DBG_MAP_UPDATES);
+        } else {
+            // Likely race: key inserted after our lookup. Re-lookup and update.
+            debug_inc(DBG_MAP_NOEXIST);
+
+            metrics = bpf_map_lookup_elem(&tc_metrics, &flow);
+            if (metrics) {
+                __sync_fetch_and_add(&metrics->packets_processed, 1);
+                __sync_fetch_and_add(&metrics->bytes_processed, pkt_len);
+
+                __u64 last = metrics->timestamp;
+                if (last)
+                    __sync_fetch_and_add(&metrics->total_latency_ns, now - last);
+
+                metrics->timestamp = now;
+                debug_inc(DBG_MAP_UPDATES);
+            }
+        }
     }
 
     return TC_ACT_OK;
-}
-
-/* ============================================================================
- * TC Classifier Programs
- * ============================================================================ */
-
-/*
- * TC ingress classifier entry point.
- * 
- * Processes incoming packets before they reach the network stack.
- * Attach with: tc filter add dev <iface> ingress bpf direct-action obj tc_hook.o sec tc_ingress
- */
-SEC("tc_ingress")
-int tc_ingress_filter(struct __sk_buff *skb)
-{
-    return process_packet(skb);
-}
-
-/*
- * TC egress classifier entry point.
- * 
- * Processes outgoing packets before they leave the interface.
- * Attach with: tc filter add dev <iface> egress bpf direct-action obj tc_hook.o sec tc_egress
- */
-SEC("tc_egress")
-int tc_egress_filter(struct __sk_buff *skb)
-{
-    return process_packet(skb);
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

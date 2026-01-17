@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Socket Hook Monitor
+eBPF Hook Monitor
 
-Loads a pre-compiled eBPF socket filter using libbpf and displays packet statistics.
+Loads pre-compiled eBPF programs using libbpf and displays packet statistics.
+Supports both socket-layer and TC (Traffic Control) hooks.
 
 Usage:
     sudo python3 python-controller --interface lo
@@ -10,7 +11,7 @@ Usage:
 Requirements:
     - libbpf: sudo apt-get install libbpf-dev
     - Root privileges (sudo)
-    - Compiled eBPF program: make
+    - Compiled eBPF programs: make
 """
 
 import argparse
@@ -20,6 +21,7 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 
@@ -33,6 +35,10 @@ ETH_P_ALL = 0x0003       # Capture all Ethernet protocols
 BPF_MAP_LOOKUP_ELEM = 1  # BPF syscall command: lookup map element
 BPF_MAP_GET_NEXT_KEY = 4 # BPF syscall command: iterate map keys
 __NR_bpf = 321           # BPF syscall number on x86_64 Linux
+
+# Hook types
+HOOK_SOCKET = "socket"
+HOOK_TC = "tc"
 
 
 # ============================================================================
@@ -273,6 +279,87 @@ def iterate_map(map_fd):
 
 
 # ============================================================================
+# TC Hook Management
+#
+# Uses the 'tc' command to attach/detach TC eBPF programs.
+# ============================================================================
+
+class TCHook:
+    """
+    Manages TC (Traffic Control) hook attachment/detachment.
+    
+    TC hooks are attached using the 'tc' command-line tool, which sets up
+    the qdisc (queueing discipline) and filters for eBPF program attachment.
+    """
+    
+    def __init__(self, interface, bpf_file):
+        self.interface = interface
+        self.bpf_file = bpf_file
+        self.attached = False
+    
+    def _run_tc(self, args, check=True):
+        """Run a tc command and return success status."""
+        cmd = ["tc"] + args
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if check and result.returncode != 0:
+                # Ignore "file exists" errors when adding qdisc (already exists)
+                if "File exists" not in result.stderr:
+                    return False, result.stderr.strip()
+            return True, result.stdout.strip()
+        except FileNotFoundError:
+            return False, "tc command not found. Install: sudo apt-get install iproute2"
+    
+    def attach(self):
+        """
+        Attach TC eBPF program to the interface.
+        
+        Steps:
+        1. Add clsact qdisc (allows both ingress and egress hooks)
+        2. Attach ingress filter with our eBPF program
+        """
+        # Step 1: Add clsact qdisc (may already exist, that's OK)
+        success, err = self._run_tc(
+            ["qdisc", "add", "dev", self.interface, "clsact"],
+            check=False  # Ignore "file exists" error
+        )
+        
+        # Step 2: Attach ingress filter
+        success, err = self._run_tc([
+            "filter", "add", "dev", self.interface,
+            "ingress", "bpf", "direct-action",
+            "obj", self.bpf_file, "sec", "tc"
+        ])
+        if not success:
+            raise OSError(f"Failed to attach TC ingress filter: {err}")
+        
+        # Step 3: Attach egress filter (catches outgoing traffic)
+        success, err = self._run_tc([
+            "filter", "add", "dev", self.interface,
+            "egress", "bpf", "direct-action",
+            "obj", self.bpf_file, "sec", "tc"
+        ])
+        if not success:
+            raise OSError(f"Failed to attach TC egress filter: {err}")
+        
+
+        self.attached = True
+    
+    def detach(self):
+        """
+        Detach TC eBPF program from the interface.
+        
+        Removes the clsact qdisc, which also removes all attached filters.
+        """
+        if not self.attached:
+            return
+        
+        # Remove the clsact qdisc (this removes all filters too)
+        self._run_tc(["qdisc", "del", "dev", self.interface, "clsact"], check=False)
+        self.attached = False
+
+
+# ============================================================================
 # Display Helpers
 # ============================================================================
 
@@ -293,6 +380,44 @@ def get_interfaces():
         return sorted(os.listdir("/sys/class/net"))
     except OSError:
         return []
+
+
+def select_hook_type():
+    """
+    Display menu and let user select which hook type to use.
+    
+    Returns:
+        HOOK_SOCKET or HOOK_TC
+    """
+    print("=" * 60)
+    print("eBPF Hook Monitor - Select Hook Type")
+    print("=" * 60)
+    print()
+    print("Available hook types:")
+    print()
+    print("  1. Socket Layer Hook")
+    print("     - Attaches to a raw packet socket")
+    print("     - Sees packets after they reach the socket layer")
+    print("     - Uses bpf_skb_load_bytes() for packet access")
+    print()
+    print("  2. TC (Traffic Control) Hook")
+    print("     - Attaches at the qdisc/traffic control layer")
+    print("     - Sees packets earlier in the network stack")
+    print("     - Uses direct packet access (more efficient)")
+    print()
+    
+    while True:
+        try:
+            choice = input("Select hook type [1-2]: ").strip()
+            if choice == "1":
+                return HOOK_SOCKET
+            elif choice == "2":
+                return HOOK_TC
+            else:
+                print("Invalid choice. Please enter 1 or 2.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(0)
 
 
 # ============================================================================
@@ -316,13 +441,23 @@ def main():
     # -------------------------------------------------------------------------
     # Parse command-line arguments
     # -------------------------------------------------------------------------
-    parser = argparse.ArgumentParser(description="eBPF Socket Hook Monitor")
-    parser.add_argument("--bpf-file", default=".output/socket_hook.o",
-                        help="Path to compiled eBPF object")
+    parser = argparse.ArgumentParser(
+        description="eBPF Hook Monitor - Monitor network traffic using eBPF",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    sudo python3 python-controller --interface eth0
+    sudo python3 python-controller --interface lo --interval 2
+    sudo python3 python-controller --hook socket --interface eth0
+    sudo python3 python-controller --hook tc --interface eth0
+        """
+    )
     parser.add_argument("--interface", default="lo",
-                        help="Network interface to monitor")
+                        help="Network interface to monitor (default: lo)")
     parser.add_argument("-i", "--interval", type=int, default=5,
-                        help="Update interval in seconds")
+                        help="Update interval in seconds (default: 5)")
+    parser.add_argument("--hook", choices=["socket", "tc"],
+                        help="Hook type: 'socket' or 'tc' (if not specified, will prompt)")
     args = parser.parse_args()
     
     # -------------------------------------------------------------------------
@@ -331,21 +466,44 @@ def main():
     if os.geteuid() != 0:
         sys.exit("ERROR: Run as root (sudo)")
     
-    if not os.path.exists(args.bpf_file):
-        sys.exit(f"ERROR: {args.bpf_file} not found. Run 'make' first.")
-    
     interfaces = get_interfaces()
     if args.interface not in interfaces:
         sys.exit(f"ERROR: Interface '{args.interface}' not found. "
                  f"Available: {', '.join(interfaces)}")
     
     # -------------------------------------------------------------------------
+    # Select hook type (prompt if not specified on command line)
+    # -------------------------------------------------------------------------
+    if args.hook:
+        hook_type = args.hook
+    else:
+        hook_type = select_hook_type()
+    
+    # Determine BPF file and program/map names based on hook type
+    if hook_type == HOOK_SOCKET:
+        bpf_file = ".output/socket_hook.o"
+        prog_name = "socket_packet_filter"
+        map_name = "socket_metrics"
+        hook_display = "Socket Layer"
+    else:  # HOOK_TC
+        bpf_file = ".output/tc_hook.o"
+        prog_name = "tc_packet_filter"
+        map_name = "tc_metrics"
+        hook_display = "TC (Traffic Control)"
+    
+    # Verify BPF file exists
+    if not os.path.exists(bpf_file):
+        sys.exit(f"ERROR: {bpf_file} not found. Run 'make' first.")
+    
+    # -------------------------------------------------------------------------
     # Display configuration
     # -------------------------------------------------------------------------
+    print()
     print("=" * 60)
-    print("Socket Hook Monitor")
+    print(f"{hook_display} Hook Monitor")
     print("=" * 60)
-    print(f"BPF File:  {args.bpf_file}")
+    print(f"Hook Type: {hook_display}")
+    print(f"BPF File:  {bpf_file}")
     print(f"Interface: {args.interface}")
     print(f"Interval:  {args.interval}s")
     print()
@@ -355,38 +513,50 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     # -------------------------------------------------------------------------
-    # Load BPF program and attach to socket
+    # Load BPF program and attach
     # -------------------------------------------------------------------------
     
     # Initialize to None for cleanup in finally block
     bpf_obj = None
     sock = None
+    tc_hook = None
     libbpf = None
     
     try:
         # Load the compiled eBPF program
         print("Loading eBPF program...")
         libbpf = LibBPF()
-        bpf_obj = libbpf.open_and_load(args.bpf_file)
+        bpf_obj = libbpf.open_and_load(bpf_file)
         print("  ✓ Loaded into kernel")
         
         # Get file descriptors for the program and map
-        prog_fd = libbpf.get_program_fd(bpf_obj, "socket_packet_filter")
-        map_fd = libbpf.get_map_fd(bpf_obj, "socket_metrics")
+        prog_fd = libbpf.get_program_fd(bpf_obj, prog_name)
+        map_fd = libbpf.get_map_fd(bpf_obj, map_name)
         print(f"  ✓ Program fd={prog_fd}, Map fd={map_fd}")
         
-        # Create a raw packet socket
-        # AF_PACKET: Layer 2 access
-        # SOCK_RAW: Include headers
-        # ETH_P_ALL: All protocols
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        # For TC hook, also get the debug map
+        debug_map_fd = None
+        if hook_type == HOOK_TC:
+            try:
+                debug_map_fd = libbpf.get_map_fd(bpf_obj, "tc_debug")
+                print(f"  ✓ Debug map fd={debug_map_fd}")
+            except ValueError:
+                print("  ⚠ Debug map not found (older tc_hook.o?)")
         
-        # Attach the BPF filter to the socket
-        sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_BPF, struct.pack("I", prog_fd))
         
-        # Bind to the specified interface
-        sock.bind((args.interface, 0))
-        print(f"  ✓ Attached to {args.interface}")
+        # Attach based on hook type
+        if hook_type == HOOK_SOCKET:
+            # Create a raw packet socket and attach BPF filter
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+            sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_BPF, struct.pack("I", prog_fd))
+            sock.bind((args.interface, 0))
+            print(f"  ✓ Attached to socket on {args.interface}")
+        
+        else:  # HOOK_TC
+            # Use tc command to attach at the TC layer
+            tc_hook = TCHook(args.interface, bpf_file)
+            tc_hook.attach()
+            print(f"  ✓ Attached TC hook on {args.interface}")
         
         # ---------------------------------------------------------------------
         # Monitoring loop
@@ -402,12 +572,27 @@ def main():
             if not keep_running:
                 break
             
+            # DEBUG: Read debug counters for TC hook
+            if hook_type == HOOK_TC and debug_map_fd is not None:
+                print("\n" + "=" * 60)
+                print("DEBUG COUNTERS (from BPF program):")
+                debug_names = ["Total packets", "IPv4 packets", "Parsed packets", "Map updates"]
+                for i in range(4):
+                    key = ctypes.c_uint32(i)
+                    value = ctypes.c_uint64(0)
+                    if _bpf_map_syscall(BPF_MAP_LOOKUP_ELEM, debug_map_fd,
+                                       ctypes.addressof(key), ctypes.addressof(value)):
+                        print(f"  {debug_names[i]}: {value.value}")
+                    else:
+                        print(f"  {debug_names[i]}: <read failed>")
+                print("=" * 60)
+            
             # Read all flows from the BPF map
             flows = iterate_map(map_fd)
             
             # Display flow statistics
             print("\n" + "-" * 60)
-            print(f"Active flows: {len(flows)}")
+            print(f"[{hook_display}] Active flows: {len(flows)}")
             print("-" * 60)
             
             if not flows:
@@ -436,10 +621,19 @@ def main():
     
     finally:
         # Clean up resources
+        print("\nCleaning up...")
+        
         if sock:
             sock.close()
+            print("  ✓ Socket closed")
+        
+        if tc_hook:
+            tc_hook.detach()
+            print("  ✓ TC hook detached")
+        
         if bpf_obj and libbpf:
             libbpf.close(bpf_obj)
+            print("  ✓ BPF object closed")
     
     print("\n" + "=" * 60)
     print("Goodbye!")
