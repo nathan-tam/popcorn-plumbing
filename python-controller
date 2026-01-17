@@ -2,14 +2,22 @@
 """
 eBPF Hook Monitor
 
-Loads pre-compiled eBPF programs using libbpf and displays packet statistics.
-Supports both socket-layer and TC (Traffic Control) hooks.
+Displays per-flow packet statistics gathered by eBPF programs.
+
+This tool supports two attachment modes:
+    - socket: loads the socket filter program via libbpf and attaches it to a raw
+        packet socket (SO_ATTACH_BPF).
+    - tc: loads and pins the TC classifier program + maps via bpftool, then
+        attaches the pinned program to clsact ingress/egress with tc.
 
 Usage:
-    sudo python3 python-controller --interface lo
+        sudo python3 python-controller --hook socket --interface ens33
+        sudo python3 python-controller --hook tc --interface ens33
 
 Requirements:
     - libbpf: sudo apt-get install libbpf-dev
+        - bpftool (for tc mode): sudo apt-get install linux-tools-generic
+        - tc (iproute2, for tc mode): sudo apt-get install iproute2
     - Root privileges (sudo)
     - Compiled eBPF programs: make
 """
@@ -34,6 +42,7 @@ SO_ATTACH_BPF = 50       # Socket option to attach eBPF program
 ETH_P_ALL = 0x0003       # Capture all Ethernet protocols
 BPF_MAP_LOOKUP_ELEM = 1  # BPF syscall command: lookup map element
 BPF_MAP_GET_NEXT_KEY = 4 # BPF syscall command: iterate map keys
+BPF_OBJ_GET = 7          # BPF syscall command: open a pinned BPF object
 __NR_bpf = 321           # BPF syscall number on x86_64 Linux
 
 # Hook types
@@ -209,8 +218,12 @@ class _BpfMapAttr(ctypes.Structure):
     _fields_ = [
         ("map_fd", ctypes.c_uint32),    # File descriptor of the map
         ("_pad", ctypes.c_uint32),      # Padding for alignment
-        ("key_ptr", ctypes.c_uint64),   # Pointer to key buffer
-        ("val_ptr", ctypes.c_uint64),   # Pointer to value/next_key buffer
+        # NOTE: The kernel requires different minimum attr sizes per command.
+        # In particular, BPF_MAP_LOOKUP_ELEM requires the 'flags' field.
+        # Keeping a single 32-byte layout works for both LOOKUP and GET_NEXT_KEY.
+        ("key_ptr", ctypes.c_uint64),   # Pointer to key buffer (or 0 for first key)
+        ("val_ptr", ctypes.c_uint64),   # Pointer to value buffer (lookup) or next_key (iterate)
+        ("flags", ctypes.c_uint64),     # BPF_MAP_LOOKUP_ELEM flags (usually 0)
     ]
 
 
@@ -230,10 +243,38 @@ def _bpf_map_syscall(cmd, map_fd, key_ptr, val_ptr):
     attr = _BpfMapAttr(
         map_fd=map_fd,
         key_ptr=key_ptr,
-        val_ptr=val_ptr
+        val_ptr=val_ptr,
+        flags=0,
     )
     ret = _libc.syscall(__NR_bpf, cmd, ctypes.byref(attr), ctypes.sizeof(attr))
     return ret >= 0
+
+
+class _BpfObjAttr(ctypes.Structure):
+    """bpf_attr layout for BPF_OBJ_GET (and BPF_OBJ_PIN)."""
+    _fields_ = [
+        ("pathname", ctypes.c_uint64),
+        ("bpf_fd", ctypes.c_uint32),
+        ("file_flags", ctypes.c_uint32),
+        ("path_fd", ctypes.c_int32),
+    ]
+
+
+def bpf_obj_get(path):
+    """Open a pinned BPF object from bpffs and return a new fd."""
+    path_bytes = os.fsencode(path) + b"\0"
+    buf = ctypes.create_string_buffer(path_bytes)
+    attr = _BpfObjAttr(
+        pathname=ctypes.addressof(buf),
+        bpf_fd=0,
+        file_flags=0,
+        path_fd=0,
+    )
+    fd = _libc.syscall(__NR_bpf, BPF_OBJ_GET, ctypes.byref(attr), ctypes.sizeof(attr))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"BPF_OBJ_GET failed for {path}")
+    return int(fd)
 
 
 def iterate_map(map_fd):
@@ -296,6 +337,11 @@ class TCHook:
         self.interface = interface
         self.bpf_file = bpf_file
         self.attached = False
+        self.metrics_fd = None
+        self.debug_fd = None
+        self.pin_root = f"/sys/fs/bpf/popplumb-tc-{interface}-{os.getpid()}"
+        self.pin_maps = os.path.join(self.pin_root, "maps")
+        self.pin_prog = None
     
     def _run_tc(self, args, check=True):
         """Run a tc command and return success status."""
@@ -314,34 +360,83 @@ class TCHook:
         """
         Attach TC eBPF program to the interface.
         
+        IMPORTANT (root cause of "TC shows zeros"):
+        If you attach with `tc ... bpf obj <file>`, tc loads its *own* instance
+        of the BPF object (and creates its own maps). If Python also loads the
+        object separately, Python will read a different map instance.
+
+        This implementation pins the program + maps into bpffs using bpftool,
+        then attaches the pinned program with tc. Python opens the pinned maps
+        via BPF_OBJ_GET, guaranteeing it reads the same maps the tc hook uses.
+
         Steps:
-        1. Add clsact qdisc (allows both ingress and egress hooks)
-        2. Attach ingress filter with our eBPF program
+        1. Add clsact qdisc
+        2. bpftool load+pin program and maps
+        3. Attach pinned program to ingress + egress
+        4. Open pinned map fds for userspace monitoring
         """
-        # Step 1: Add clsact qdisc (may already exist, that's OK)
-        success, err = self._run_tc(
-            ["qdisc", "add", "dev", self.interface, "clsact"],
-            check=False  # Ignore "file exists" error
-        )
-        
-        # Step 2: Attach ingress filter
-        success, err = self._run_tc([
-            "filter", "add", "dev", self.interface,
-            "ingress", "bpf", "direct-action",
-            "obj", self.bpf_file, "sec", "tc"
-        ])
+        # Step 1: Add clsact qdisc (may already exist).
+        success, err = self._run_tc(["qdisc", "add", "dev", self.interface, "clsact"], check=True)
         if not success:
-            raise OSError(f"Failed to attach TC ingress filter: {err}")
+            raise OSError(f"Failed to add clsact qdisc: {err}")
         
-        # Step 3: Attach egress filter (catches outgoing traffic)
-        success, err = self._run_tc([
-            "filter", "add", "dev", self.interface,
-            "egress", "bpf", "direct-action",
-            "obj", self.bpf_file, "sec", "tc"
-        ])
-        if not success:
-            raise OSError(f"Failed to attach TC egress filter: {err}")
-        
+        # Ensure bpffs exists (most distros mount it at boot, but be defensive).
+        os.makedirs("/sys/fs/bpf", exist_ok=True)
+        subprocess.run(["mount", "-t", "bpf", "bpf", "/sys/fs/bpf"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Create pin directories.
+        os.makedirs(self.pin_maps, exist_ok=True)
+
+        # Load and pin program(s) + maps. The tc program is a SCHED_CLS (classifier).
+        # `pinmaps` makes all maps available at predictable paths.
+        cmd = [
+            "bpftool", "prog", "loadall",
+            self.bpf_file, self.pin_root,
+            "type", "classifier",
+            "pinmaps", self.pin_maps,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise OSError(f"bpftool loadall failed: {result.stderr.strip() or result.stdout.strip()}")
+
+        # Discover the pinned program path. loadall pins programs directly under pin_root.
+        prog_candidates = []
+        for entry in os.listdir(self.pin_root):
+            full = os.path.join(self.pin_root, entry)
+            if entry == "maps":
+                continue
+            if os.path.isdir(full):
+                continue
+            prog_candidates.append(full)
+
+        if not prog_candidates:
+            raise OSError("bpftool loadall did not pin any program")
+
+        # Prefer the function name if present; otherwise take the only entry.
+        prog_candidates.sort()
+        for p in prog_candidates:
+            if os.path.basename(p) in ("tc_packet_filter", "tc"):
+                self.pin_prog = p
+                break
+        if self.pin_prog is None:
+            self.pin_prog = prog_candidates[0]
+
+        # Attach pinned program to ingress+egress. Use 'replace' to be repeatable.
+        for direction in ("ingress", "egress"):
+            success, err = self._run_tc([
+                "filter", "replace", "dev", self.interface,
+                direction, "bpf", "direct-action",
+                "object-pinned", self.pin_prog,
+            ])
+            if not success:
+                raise OSError(f"Failed to attach TC {direction} filter: {err}")
+
+        # Open pinned maps for monitoring.
+        metrics_path = os.path.join(self.pin_maps, "tc_metrics")
+        debug_path = os.path.join(self.pin_maps, "tc_debug")
+        self.metrics_fd = bpf_obj_get(metrics_path)
+        self.debug_fd = bpf_obj_get(debug_path) if os.path.exists(debug_path) else None
 
         self.attached = True
     
@@ -356,6 +451,46 @@ class TCHook:
         
         # Remove the clsact qdisc (this removes all filters too)
         self._run_tc(["qdisc", "del", "dev", self.interface, "clsact"], check=False)
+        # Close any imported map fds.
+        for fd in (self.metrics_fd, self.debug_fd):
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.metrics_fd = None
+        self.debug_fd = None
+
+        # Best-effort cleanup of pinned objects.
+        try:
+            if os.path.isdir(self.pin_maps):
+                for name in os.listdir(self.pin_maps):
+                    try:
+                        os.unlink(os.path.join(self.pin_maps, name))
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(self.pin_maps)
+                except OSError:
+                    pass
+
+            if os.path.isdir(self.pin_root):
+                for name in os.listdir(self.pin_root):
+                    full = os.path.join(self.pin_root, name)
+                    if os.path.isdir(full):
+                        continue
+                    try:
+                        os.unlink(full)
+                    except OSError:
+                        pass
+                try:
+                    os.rmdir(self.pin_root)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
         self.attached = False
 
 
@@ -365,8 +500,9 @@ class TCHook:
 
 def format_ip(ip_int):
     """Convert 32-bit integer to dotted decimal (e.g., "127.0.0.1")."""
-    # IP is in network byte order, pack as-is
-    return socket.inet_ntoa(struct.pack("I", ip_int))
+    # Stored in the BPF map in network byte order.
+    # `ctypes` exposes it as a host-endian integer, so normalize first.
+    return socket.inet_ntoa(struct.pack("!I", socket.ntohl(ip_int)))
 
 
 def format_port(port_int):
@@ -380,44 +516,6 @@ def get_interfaces():
         return sorted(os.listdir("/sys/class/net"))
     except OSError:
         return []
-
-
-def select_hook_type():
-    """
-    Display menu and let user select which hook type to use.
-    
-    Returns:
-        HOOK_SOCKET or HOOK_TC
-    """
-    print("=" * 60)
-    print("eBPF Hook Monitor - Select Hook Type")
-    print("=" * 60)
-    print()
-    print("Available hook types:")
-    print()
-    print("  1. Socket Layer Hook")
-    print("     - Attaches to a raw packet socket")
-    print("     - Sees packets after they reach the socket layer")
-    print("     - Uses bpf_skb_load_bytes() for packet access")
-    print()
-    print("  2. TC (Traffic Control) Hook")
-    print("     - Attaches at the qdisc/traffic control layer")
-    print("     - Sees packets earlier in the network stack")
-    print("     - Uses direct packet access (more efficient)")
-    print()
-    
-    while True:
-        try:
-            choice = input("Select hook type [1-2]: ").strip()
-            if choice == "1":
-                return HOOK_SOCKET
-            elif choice == "2":
-                return HOOK_TC
-            else:
-                print("Invalid choice. Please enter 1 or 2.")
-        except (EOFError, KeyboardInterrupt):
-            print("\nAborted.")
-            sys.exit(0)
 
 
 # ============================================================================
@@ -441,23 +539,17 @@ def main():
     # -------------------------------------------------------------------------
     # Parse command-line arguments
     # -------------------------------------------------------------------------
-    parser = argparse.ArgumentParser(
-        description="eBPF Hook Monitor - Monitor network traffic using eBPF",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    sudo python3 python-controller --interface eth0
-    sudo python3 python-controller --interface lo --interval 2
-    sudo python3 python-controller --hook socket --interface eth0
-    sudo python3 python-controller --hook tc --interface eth0
-        """
-    )
+    parser = argparse.ArgumentParser(description="eBPF Hook Monitor")
+    parser.add_argument("--hook", required=True, choices=[HOOK_SOCKET, HOOK_TC],
+                        help="Which hook to use: 'socket' or 'tc'")
     parser.add_argument("--interface", default="lo",
                         help="Network interface to monitor (default: lo)")
     parser.add_argument("-i", "--interval", type=int, default=5,
                         help="Update interval in seconds (default: 5)")
-    parser.add_argument("--hook", choices=["socket", "tc"],
-                        help="Hook type: 'socket' or 'tc' (if not specified, will prompt)")
+    parser.add_argument("--top", type=int, default=10,
+                        help="Number of top flows to show (default: 10)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print TC debug counters each interval (tc mode only)")
     args = parser.parse_args()
     
     # -------------------------------------------------------------------------
@@ -471,13 +563,7 @@ Examples:
         sys.exit(f"ERROR: Interface '{args.interface}' not found. "
                  f"Available: {', '.join(interfaces)}")
     
-    # -------------------------------------------------------------------------
-    # Select hook type (prompt if not specified on command line)
-    # -------------------------------------------------------------------------
-    if args.hook:
-        hook_type = args.hook
-    else:
-        hook_type = select_hook_type()
+    hook_type = args.hook
     
     # Determine BPF file and program/map names based on hook type
     if hook_type == HOOK_SOCKET:
@@ -487,8 +573,6 @@ Examples:
         hook_display = "Socket Layer"
     else:  # HOOK_TC
         bpf_file = ".output/tc_hook.o"
-        prog_name = "tc_packet_filter"
-        map_name = "tc_metrics"
         hook_display = "TC (Traffic Control)"
     
     # Verify BPF file exists
@@ -513,39 +597,31 @@ Examples:
     signal.signal(signal.SIGTERM, signal_handler)
     
     # -------------------------------------------------------------------------
-    # Load BPF program and attach
+    # Load/attach BPF program
     # -------------------------------------------------------------------------
-    
+
     # Initialize to None for cleanup in finally block
     bpf_obj = None
     sock = None
     tc_hook = None
     libbpf = None
+    map_fd = None
+    debug_fd = None
     
     try:
-        # Load the compiled eBPF program
-        print("Loading eBPF program...")
-        libbpf = LibBPF()
-        bpf_obj = libbpf.open_and_load(bpf_file)
-        print("  ✓ Loaded into kernel")
-        
-        # Get file descriptors for the program and map
-        prog_fd = libbpf.get_program_fd(bpf_obj, prog_name)
-        map_fd = libbpf.get_map_fd(bpf_obj, map_name)
-        print(f"  ✓ Program fd={prog_fd}, Map fd={map_fd}")
-        
-        # For TC hook, also get the debug map
-        debug_map_fd = None
-        if hook_type == HOOK_TC:
-            try:
-                debug_map_fd = libbpf.get_map_fd(bpf_obj, "tc_debug")
-                print(f"  ✓ Debug map fd={debug_map_fd}")
-            except ValueError:
-                print("  ⚠ Debug map not found (older tc_hook.o?)")
-        
-        
         # Attach based on hook type
         if hook_type == HOOK_SOCKET:
+            # Load the compiled eBPF program
+            print("Loading eBPF program...")
+            libbpf = LibBPF()
+            bpf_obj = libbpf.open_and_load(bpf_file)
+            print("  ✓ Loaded into kernel")
+
+            # Get file descriptors for the program and map
+            prog_fd = libbpf.get_program_fd(bpf_obj, prog_name)
+            map_fd = libbpf.get_map_fd(bpf_obj, map_name)
+            print(f"  ✓ Program fd={prog_fd}, Map fd={map_fd}")
+
             # Create a raw packet socket and attach BPF filter
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
             sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_BPF, struct.pack("I", prog_fd))
@@ -553,10 +629,14 @@ Examples:
             print(f"  ✓ Attached to socket on {args.interface}")
         
         else:  # HOOK_TC
-            # Use tc command to attach at the TC layer
+            # Attach via tc using a pinned program/maps, and read pinned maps.
+            print("Attaching TC filters (bpftool pin + tc object-pinned)...")
             tc_hook = TCHook(args.interface, bpf_file)
             tc_hook.attach()
             print(f"  ✓ Attached TC hook on {args.interface}")
+
+            map_fd = tc_hook.metrics_fd
+            debug_fd = tc_hook.debug_fd
         
         # ---------------------------------------------------------------------
         # Monitoring loop
@@ -572,15 +652,25 @@ Examples:
             if not keep_running:
                 break
             
-            # DEBUG: Read debug counters for TC hook
-            if hook_type == HOOK_TC and debug_map_fd is not None:
+            # Optional debug counters for TC hook
+            if hook_type == HOOK_TC and args.debug and debug_fd is not None:
                 print("\n" + "=" * 60)
                 print("DEBUG COUNTERS (from BPF program):")
-                debug_names = ["Total packets", "IPv4 packets", "Parsed packets", "Map updates"]
-                for i in range(4):
+                # Keep in sync with the enum in src/ebpf/tc_hook.c
+                debug_names = [
+                    "Total packets",
+                    "Not IPv4",
+                    "IPv4 packets",
+                    "Parsed packets",
+                    "Map updates",
+                    "Map insert race",
+                    "Bounds errors",
+                    "Header/frag errors",
+                ]
+                for i in range(len(debug_names)):
                     key = ctypes.c_uint32(i)
                     value = ctypes.c_uint64(0)
-                    if _bpf_map_syscall(BPF_MAP_LOOKUP_ELEM, debug_map_fd,
+                    if _bpf_map_syscall(BPF_MAP_LOOKUP_ELEM, debug_fd,
                                        ctypes.addressof(key), ctypes.addressof(value)):
                         print(f"  {debug_names[i]}: {value.value}")
                     else:
@@ -602,8 +692,8 @@ Examples:
             # Sort by packet count (highest first)
             flows.sort(key=lambda x: x[1].packets_processed, reverse=True)
             
-            # Show top 10 flows
-            for i, (key, val) in enumerate(flows[:10], 1):
+            # Show top N flows
+            for i, (key, val) in enumerate(flows[:max(0, args.top)], 1):
                 proto = proto_names.get(key.proto, f"Proto-{key.proto}")
                 src = f"{format_ip(key.src_ip)}:{format_port(key.src_port)}"
                 dst = f"{format_ip(key.dst_ip)}:{format_port(key.dst_port)}"

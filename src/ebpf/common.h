@@ -42,6 +42,8 @@ struct flow_key {
  * Packet metrics (per-flow statistics)
  * 
  * Tracks statistics for each flow. Stored as values in BPF hash maps.
+ * The TC hook currently uses `total_latency_ns` as an accumulated
+ * inter-arrival-time proxy (now - last_timestamp). The socket hook leaves it 0.
  * 
  * Size: 32 bytes (with padding)
  * 
@@ -55,8 +57,12 @@ struct flow_key {
 struct packet_metrics {
     __u32 packets_processed;     /* Number of packets seen */
     __u64 bytes_processed;       /* Total bytes seen (includes all headers) */
-    __u64 total_latency_ns;      /* Reserved for future latency tracking */
+    __u64 total_latency_ns;      /* Accumulated inter-arrival deltas (ns) */
     __u64 timestamp;             /* Last seen time (bpf_ktime_get_ns) */
 };
+
+/* ABI guardrails: these structs are consumed by userspace (python-controller). */
+_Static_assert(sizeof(struct flow_key) == 16, "flow_key must be 16 bytes");
+_Static_assert(sizeof(struct packet_metrics) == 32, "packet_metrics must be 32 bytes");
 
 #endif /* __COMMON_H__ */

@@ -11,6 +11,17 @@
 
 #include "common.h" // <-- use shared structs (flow_key, packet_metrics) expected by userspace
 
+// EtherTypes (avoid relying on toolchain/kernel header availability)
+#ifndef ETH_P_IP
+#define ETH_P_IP 0x0800
+#endif
+#ifndef ETH_P_8021Q
+#define ETH_P_8021Q 0x8100
+#endif
+#ifndef ETH_P_8021AD
+#define ETH_P_8021AD 0x88A8
+#endif
+
 // Some toolchains won't expose these via vmlinux.h alone.
 #ifndef IPPROTO_TCP
 #define IPPROTO_TCP 6
@@ -31,27 +42,6 @@
 #define MAX_VLAN_DEPTH 2
 
 #define TC_ACT_OK    0
-/* ============================================================================
- * Data Structures
- * ============================================================================ */
-
-// PACKED ensures no compiler padding is inserted between fields.
-// This is critical for BPF map keys.
-struct flow_key {
-    __u32 src_ip;
-    __u32 dst_ip;
-    __u16 src_port;
-    __u16 dst_port;
-    __u8  proto;
-    __u8  pad[3]; // Explicit padding to reach 4-byte alignment
-} __attribute__((packed));
-
-struct packet_metrics {
-    __u64 packets_processed;
-    __u64 bytes_processed;
-    __u64 total_latency_ns;
-    __u64 timestamp;
-};
 
 /* ============================================================================
  * BPF Maps
@@ -99,11 +89,12 @@ int tc_packet_filter(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+    __u8 *data8 = data;
 
     debug_inc(DBG_TOTAL_PACKETS);
 
     // 1. PARSE ETHERNET HEADER
-    struct ethhdr *eth = data;
+    struct ethhdr *eth = (struct ethhdr *)data8;
     if ((void *)(eth + 1) > data_end) {
         debug_inc(DBG_ERR_BOUNDS);
         return TC_ACT_OK;
@@ -117,7 +108,7 @@ int tc_packet_filter(struct __sk_buff *skb)
     #pragma unroll
     for (int i = 0; i < MAX_VLAN_DEPTH; i++) {
         if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
-            struct vlan_hdr *vhdr = data + l3_offset;
+            struct vlan_hdr *vhdr = (struct vlan_hdr *)(data8 + l3_offset);
             if ((void *)(vhdr + 1) > data_end) {
                 debug_inc(DBG_ERR_BOUNDS);
                 return TC_ACT_OK;
@@ -138,7 +129,7 @@ int tc_packet_filter(struct __sk_buff *skb)
     debug_inc(DBG_IPV4_PACKETS);
 
     // 4. PARSE IP HEADER
-    struct iphdr *ip = data + l3_offset;
+    struct iphdr *ip = (struct iphdr *)(data8 + l3_offset);
     if ((void *)(ip + 1) > data_end) {
         debug_inc(DBG_ERR_BOUNDS);
         return TC_ACT_OK;
@@ -158,7 +149,7 @@ int tc_packet_filter(struct __sk_buff *skb)
     }
 
     // Ensure variable length IP header is within bounds
-    if ((void *)ip + ip_hlen > data_end) {
+    if ((void *)((__u8 *)ip + ip_hlen) > data_end) {
         debug_inc(DBG_ERR_BOUNDS);
         return TC_ACT_OK;
     }
@@ -171,24 +162,32 @@ int tc_packet_filter(struct __sk_buff *skb)
     }
 
     // 5. INITIALIZE FLOW KEY
-    struct flow_key flow;
-    __builtin_memset(&flow, 0, sizeof(flow));
+    // IMPORTANT: `struct flow_key` is shared with userspace via `common.h`.
+    // Keep the padding zeroed so map lookups are deterministic.
+    struct flow_key flow = {
+        .src_ip = 0,
+        .dst_ip = 0,
+        .src_port = 0,
+        .dst_port = 0,
+        .proto = 0,
+        ._pad = {0, 0, 0},
+    };
 
     flow.src_ip = ip->saddr;
     flow.dst_ip = ip->daddr;
     flow.proto = ip->protocol;
 
     // 6. PARSE L4 (TCP/UDP)
-    void *l4 = (void *)ip + ip_hlen;
+    __u8 *l4 = (__u8 *)ip + ip_hlen;
 
     if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = l4;
+        struct tcphdr *tcp = (struct tcphdr *)l4;
         if ((void *)(tcp + 1) <= data_end) {
             flow.src_port = tcp->source;
             flow.dst_port = tcp->dest;
         }
     } else if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = l4;
+        struct udphdr *udp = (struct udphdr *)l4;
         if ((void *)(udp + 1) <= data_end) {
             flow.src_port = udp->source;
             flow.dst_port = udp->dest;
